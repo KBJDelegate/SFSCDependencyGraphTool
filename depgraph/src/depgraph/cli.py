@@ -44,8 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-empty",
         action="store_true",
         help="keep sheets with no rows as graph nodes. Off by default: they "
-        "carry no columns, key or references, so they only pad the graph. "
-        "Their names are always listed under empty_sheets.",
+        "carry no columns, key or references, so nothing is built from them.",
     )
     p.add_argument(
         "--skip-empty",
@@ -165,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         empty_names = sorted(n.id for n in nodes if n.rows == 0)
         if not args.include_empty and empty_names:
             nodes = [n for n in nodes if n.rows > 0]
-            log(f"{len(empty_names)} sheets had no rows, listed under empty_sheets")
+            log(f"excluded {len(empty_names)} sheets with no rows")
         if not nodes:
             raise SystemExit("every sheet was empty; nothing to graph")
 
@@ -177,7 +176,6 @@ def main(argv: list[str] | None = None) -> int:
             overlap_threshold=args.overlap_threshold,
         )
         graph.source = str(args.source)
-        graph.empty_sheets = empty_names
         total_rows = sum(n.rows for n in nodes)
         graph.stats = {
             "sheets": len(nodes),
@@ -188,7 +186,6 @@ def main(argv: list[str] | None = None) -> int:
             "read_seconds": round(read_s, 2),
             "total_seconds": round(time.perf_counter() - started, 2),
             "sampled": bool(args.max_rows),
-            "empty_sheets": len(empty_names),
             "include_list": str(args.include) if args.include else None,
             "unmatched_include_names": unmatched,
         }

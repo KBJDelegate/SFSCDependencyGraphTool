@@ -274,13 +274,23 @@ def test_empty_sheets_are_dropped_by_default(extract, tmp_path):
     g = run(src, tmp_path / "keep")
     ids = {n["id"] for n in g["nodes"]}
     assert not ({"EmptyObject", "AlsoEmpty__c"} & ids)
-    # The fact that the export shipped them is still recorded, by name.
-    assert g["empty_sheets"] == ["AlsoEmpty__c", "EmptyObject"]
-    assert g["stats"]["empty_sheets"] == 2
+    # Nothing at all is built from them: no nodes, no list, no stat.
+    assert "empty_sheets" not in g
+    assert "empty_sheets" not in g["stats"]
+    assert not any("Empty" in e["from"] or "Empty" in e["to"] for e in g["edges"])
     # Dropping them changes no real relationship...
     assert {(e["from"], e["to"]) for e in g["edges"]} == EXPECTED
     # ...and keeps them out of the load order, whose job is processing order.
     assert "EmptyObject" not in {n for layer in g["load_order"] for n in layer}
+
+
+def test_nothing_is_built_from_empty_sheets_in_the_diagram(extract, tmp_path):
+    src = _with_empty_sheets(extract, tmp_path / "e5.zip")
+    out = tmp_path / "d.json"
+    assert main([str(src), "-o", str(out), "-q"]) == 0
+    mmd = (tmp_path / "d.mmd").read_text()
+    assert "EmptyObject" not in mmd
+    assert "AlsoEmpty__c" not in mmd
 
 
 def test_include_empty_puts_them_back_as_nodes(extract, tmp_path):
@@ -293,7 +303,6 @@ def test_include_empty_puts_them_back_as_nodes(extract, tmp_path):
     empty = next(n for n in g["nodes"] if n["id"] == "EmptyObject")
     assert "rows" not in empty or empty["rows"] == 0
     assert empty["warnings"] == ["empty sheet"]
-    assert g["empty_sheets"] == ["AlsoEmpty__c", "EmptyObject"]
 
 
 def test_skip_empty_is_still_accepted_as_a_no_op(extract, tmp_path):
@@ -359,7 +368,6 @@ def test_include_list_and_empty_dropping_combine(extract, tmp_path):
     assert main([str(src), "-o", str(out), "--include", str(lst), "-q"]) == 0
     g = json.loads(out.read_text())
     assert {n["id"] for n in g["nodes"]} == {"Account", "Contact"}
-    assert g["stats"]["empty_sheets"] == 1
 
 
 def test_cycles_are_detected_and_reported():

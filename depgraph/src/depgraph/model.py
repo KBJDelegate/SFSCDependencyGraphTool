@@ -87,9 +87,6 @@ class Graph:
     stats: dict = field(default_factory=dict)
     load_order: list[list[str]] = field(default_factory=list)
     cycles: list[list[str]] = field(default_factory=list)
-    #: Sheets the export shipped with no rows. Kept as bare names: they have no
-    #: columns, key or references, so as nodes they were pure noise.
-    empty_sheets: list[str] = field(default_factory=list)
 
     def node(self, node_id: str) -> Node | None:
         return next((n for n in self.nodes if n.id == node_id), None)

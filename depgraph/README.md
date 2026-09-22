@@ -76,7 +76,6 @@ Key fields:
 | `polymorphic_group` | One column pointing at several tables (`Task.WhatId` → Account *and* Opportunity). |
 | `load_order` | Tables in dependency order, targets first. The last layer holds anything unorderable because of a cycle. |
 | `unresolved` | References pointing outside the extract, named where the prefix is a known standard object. |
-| `empty_sheets` | Objects the export shipped with no rows. Not nodes, since they have no columns, key or references. |
 | `ref` (on a column) | Denormalised pointer, so a column answers "what does this point at" without cross-referencing `edges`. |
 
 The `.mmd` file is a Mermaid ER diagram for humans reviewing what was inferred;
@@ -85,23 +84,37 @@ you also want Graphviz DOT, where dashed edges are `name-only` guesses.
 
 ## Narrowing a full org export
 
+### Sheets with no rows are excluded entirely
+
 A full Salesforce export ships *every* object definition, most of which hold no
 records at all — on a real export, **730 of 865 sheets**.
 
-Those are dropped by default. An empty sheet has no columns, no key and no
-references, so as a node it contributes nothing to a dependency graph while
-padding `load_order`, whose whole job is to give a processing order. Their names
-are still reported, under `empty_sheets`, because "this object was exported and
-holds zero records" is useful — for a migration it is proof you can skip it.
+**Nothing is built from an empty sheet.** It is not a node, it produces no
+edges, it is not an entity in the diagram, and it is not named or counted
+anywhere in the JSON. An empty sheet has no columns, no key and no references,
+so there is nothing to build from; including one would only pad `load_order`,
+whose whole job is to give a processing order.
 
-```json
-"empty_sheets": ["ActionLinkGroupTemplate", "Asset", "Campaign", "Case", ...]
+The consequence to be aware of: **a missing object and an object exported with
+zero rows look identical in the output.** If you need to tell them apart, run
+with `--include-empty`, which keeps them as nodes carrying
+`warnings: ["empty sheet"]`. The run always prints how many were excluded:
+
+```
+excluded 730 sheets with no rows
 ```
 
-Pass `--include-empty` to keep them as nodes instead. (`--skip-empty` is still
-accepted and does nothing, since it is now the default.)
+(`--skip-empty` is still accepted and does nothing, since this is the default.)
 
-`--include` is the lever for cutting the populated objects down. Give it a text file listing the sheets you
+### Audit fields are kept
+
+Salesforce audit lookups — `CreatedById`, `LastModifiedById`, `OwnerId` — are
+real references and are included as normal edges. Be aware they dominate: on
+that export they are **287 of 457 edges**, all pointing at `User`, which gives
+`User` 316 incoming arrows and makes a whole-org diagram hard to read. Use
+`--include` for a legible one.
+
+`--include` is also the lever for cutting the populated objects down. Give it a text file listing the sheets you
 want, one per line, and everything else is skipped **without being read**:
 
 ```bash

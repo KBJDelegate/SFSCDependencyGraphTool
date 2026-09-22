@@ -32,9 +32,8 @@ READING_GUIDE = (
     "extract. polymorphic_group marks one column pointing at several tables. "
     "load_order lists tables in dependency order, targets first; its last layer "
     "holds anything unorderable because of cycles[]. unresolved[] are references "
-    "pointing outside this extract, which are not errors. empty_sheets[] names "
-    "objects the export shipped with no rows at all; they are not nodes because "
-    "they have no columns, key or references."
+    "pointing outside this extract, which are not errors. Sheets the export "
+    "shipped with no rows are excluded entirely."
 )
 
 
@@ -118,7 +117,6 @@ def to_dict(graph: Graph) -> dict:
             "reading_guide": READING_GUIDE,
             "load_order": graph.load_order,
             "cycles": graph.cycles,
-            "empty_sheets": graph.empty_sheets,
             "nodes": nodes,
             "edges": edges,
             "unresolved": [
