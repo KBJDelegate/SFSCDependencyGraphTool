@@ -402,10 +402,28 @@ def test_cycles_are_detected_and_reported():
     ]
     layers, cycles = _topology(graph)
     assert cycles == [["A", "B"]]
-    # C is not itself in the cycle, but it depends on A, so it cannot be
-    # ordered either; everything unorderable lands in the final layer.
-    assert sorted(layers[-1]) == ["A", "B", "C"]
-    assert len(layers) == 1
+    # The cycle is condensed into one unit, so C still orders after it rather
+    # than being dragged into an unorderable lump.
+    assert layers == [["A", "B"], ["C"]]
+
+
+def test_a_cycle_does_not_poison_the_order_of_everything_else():
+    """Regression: User sits in a real Salesforce cycle and almost every object
+    has an OwnerId, so an uncondensed graph collapsed to one useless layer."""
+    names = ["User", "Account", "Contact", "Opportunity", "Task"]
+    graph = Graph(nodes=[Node(id=n, source="x", sheet="x", rows=1) for n in names])
+    pairs = [
+        ("Account", "User"), ("User", "Contact"), ("Contact", "Account"),
+        ("Opportunity", "Account"), ("Task", "Opportunity"),
+    ]
+    graph.edges = [
+        Edge(a, "c", b, "Id", "lookup", "N:1", 0.9, 1.0, 0.0) for a, b in pairs
+    ]
+    layers, cycles = _topology(graph)
+    assert cycles == [["Account", "Contact", "User"]]
+    assert layers == [["Account", "Contact", "User"], ["Opportunity"], ["Task"]]
+    # Every node is placed exactly once.
+    assert sorted(n for layer in layers for n in layer) == sorted(names)
 
 
 def test_missing_source_is_a_clean_error(tmp_path):

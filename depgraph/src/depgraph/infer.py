@@ -229,31 +229,52 @@ def infer(
 
 
 def _topology(graph: Graph) -> tuple[list[list[str]], list[list[str]]]:
+    """Layer the nodes so every dependency comes before its dependents.
+
+    Cycles are condensed into a single unit first. Salesforce has genuine
+    circular references (Account -> User -> Contact -> Account), and without
+    condensing them nothing downstream could ever be placed: because almost
+    every object has an OwnerId, one tangle involving User made the whole graph
+    unorderable and collapsed load_order into a single meaningless layer.
+    """
     ids = [n.id for n in graph.nodes]
     deps: dict[str, set[str]] = {i: set() for i in ids}
     for e in graph.edges:
         if e.to_node != e.from_node and e.to_node in deps and e.from_node in deps:
             deps[e.from_node].add(e.to_node)
 
-    placed: set[str] = set()
-    layers: list[list[str]] = []
-    remaining = set(ids)
-    while remaining:
-        layer = sorted(n for n in remaining if deps[n] <= placed)
-        if not layer:
-            break  # everything left is tangled in a cycle
-        layers.append(layer)
-        placed |= set(layer)
-        remaining -= set(layer)
+    # Condense: each strongly connected component becomes one unit, so what is
+    # left is a DAG and Kahn's algorithm always terminates having placed all.
+    comps = _sccs(deps, min_size=1)
+    comp_of = {n: i for i, c in enumerate(comps) for n in c}
+    cdeps: dict[int, set[int]] = {i: set() for i in range(len(comps))}
+    for node, targets in deps.items():
+        for target in targets:
+            if comp_of[target] != comp_of[node]:
+                cdeps[comp_of[node]].add(comp_of[target])
 
-    cycles = _sccs({n: deps[n] & remaining for n in remaining}) if remaining else []
-    if remaining:
-        layers.append(sorted(remaining))
+    placed: set[int] = set()
+    remaining = set(cdeps)
+    layers: list[list[str]] = []
+    while remaining:
+        ready = [c for c in remaining if cdeps[c] <= placed]
+        if not ready:  # impossible for a DAG; keep the output honest if it happens
+            layers.append(sorted(n for c in sorted(remaining) for n in comps[c]))
+            break
+        layers.append(sorted(n for c in ready for n in comps[c]))
+        placed |= set(ready)
+        remaining -= set(ready)
+
+    cycles = sorted(sorted(c) for c in comps if len(c) > 1)
     return layers, cycles
 
 
-def _sccs(adj: dict[str, set[str]]) -> list[list[str]]:
-    """Tarjan, iterative, so a deep graph cannot blow the stack."""
+def _sccs(adj: dict[str, set[str]], min_size: int = 2) -> list[list[str]]:
+    """Tarjan, iterative, so a deep graph cannot blow the stack.
+
+    min_size=1 returns every component, singletons included, which is what the
+    condensation needs; min_size=2 returns only the actual cycles.
+    """
     index: dict[str, int] = {}
     low: dict[str, int] = {}
     on_stack: set[str] = set()
@@ -294,6 +315,6 @@ def _sccs(adj: dict[str, set[str]]) -> list[list[str]]:
                         comp.append(w)
                         if w == node:
                             break
-                    if len(comp) > 1:
+                    if len(comp) >= min_size:
                         out.append(sorted(comp))
     return out

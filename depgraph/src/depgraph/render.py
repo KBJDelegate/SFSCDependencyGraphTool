@@ -30,8 +30,10 @@ READING_GUIDE = (
     "there, nothing resolved. Where resolve_rate is between 0 and 0.9 the "
     "relationship is real but some rows point at records missing from the "
     "extract. polymorphic_group marks one column pointing at several tables. "
-    "load_order lists tables in dependency order, targets first; its last layer "
-    "holds anything unorderable because of cycles[]. unresolved[] are references "
+    "load_order lists tables in dependency order, targets first, and every table "
+    "appears exactly once. A layer holding several tables that are also listed "
+    "together in cycles[] means they reference each other circularly and have "
+    "to be handled as one unit. unresolved[] are references "
     "pointing outside this extract, which are not errors. Sheets the export "
     "shipped with no rows are excluded entirely."
 )

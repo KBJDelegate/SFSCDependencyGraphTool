@@ -74,7 +74,7 @@ Key fields:
 | `confidence` | Only ranks *how the target was identified*. Below 1.0 does **not** mean unverified: an edge loses a little merely because the column name lacks the target's name. Judge reliability from `resolve_rate`. |
 | `kind` | `lookup`, `self` (self-reference), or `name-only` (names line up, no value matched — a guess). |
 | `polymorphic_group` | One column pointing at several tables (`Task.WhatId` → Account *and* Opportunity). |
-| `load_order` | Tables in dependency order, targets first. The last layer holds anything unorderable because of a cycle. |
+| `load_order` | Tables in dependency order, targets first; every table appears exactly once. A layer holding several tables that also appear together in `cycles` references itself circularly and must be handled as one unit. |
 | `unresolved` | References pointing outside the extract, named where the prefix is a known standard object. |
 | `ref` (on a column) | Denormalised pointer, so a column answers "what does this point at" without cross-referencing `edges`. |
 
@@ -162,7 +162,11 @@ rather than the size of the data.
    proposal with an exact semi-join over the staged columns. Every edge carries
    a measured resolve rate, not a guess.
 3. **Render**. JSON, plus optional Mermaid/DOT. Load order by Kahn layering,
-   cycles by Tarjan.
+   cycles by Tarjan. Cycles are condensed into a single unit before layering,
+   because Salesforce has genuine circular references (Account -> User ->
+   Contact -> Account) and almost every object carries an `OwnerId`: without
+   condensing, one tangle involving `User` leaves nothing placeable and
+   `load_order` collapses into a single meaningless layer.
 
 The Salesforce profile's leverage is that the first three characters of a record
 Id are the object's **key prefix**, so a reference names its own target. That is
