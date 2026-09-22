@@ -76,6 +76,7 @@ Key fields:
 | `polymorphic_group` | One column pointing at several tables (`Task.WhatId` → Account *and* Opportunity). |
 | `load_order` | Tables in dependency order, targets first. The last layer holds anything unorderable because of a cycle. |
 | `unresolved` | References pointing outside the extract, named where the prefix is a known standard object. |
+| `empty_sheets` | Objects the export shipped with no rows. Not nodes, since they have no columns, key or references. |
 | `ref` (on a column) | Denormalised pointer, so a column answers "what does this point at" without cross-referencing `edges`. |
 
 The `.mmd` file is a Mermaid ER diagram for humans reviewing what was inferred;
@@ -84,22 +85,23 @@ you also want Graphviz DOT, where dashed edges are `name-only` guesses.
 
 ## Narrowing a full org export
 
-A full Salesforce export ships *every* object definition, so most sheets are
-empty and the graph is mostly noise. Two flags cut it down.
+A full Salesforce export ships *every* object definition, most of which hold no
+records at all — on a real export, **730 of 865 sheets**.
 
-`--skip-empty` drops sheets with no rows:
+Those are dropped by default. An empty sheet has no columns, no key and no
+references, so as a node it contributes nothing to a dependency graph while
+padding `load_order`, whose whole job is to give a processing order. Their names
+are still reported, under `empty_sheets`, because "this object was exported and
+holds zero records" is useful — for a migration it is proof you can skip it.
 
-```bash
-depgraph extract.ZIP --skip-empty
+```json
+"empty_sheets": ["ActionLinkGroupTemplate", "Asset", "Campaign", "Case", ...]
 ```
 
-On a real 865-sheet export that leaves the 135 objects with data. Note the file
-does not shrink proportionally — empty sheets cost almost nothing, because the
-bytes are in the column metadata of the *populated* objects (2,941 columns
-across those 135). Measured on that export: 584 KB -> 466 KB, a 20% cut. It is
-worth it for navigability, not for size.
+Pass `--include-empty` to keep them as nodes instead. (`--skip-empty` is still
+accepted and does nothing, since it is now the default.)
 
-`--include` is the real size lever. Give it a text file listing the sheets you
+`--include` is the lever for cutting the populated objects down. Give it a text file listing the sheets you
 want, one per line, and everything else is skipped **without being read**:
 
 ```bash
@@ -202,7 +204,7 @@ It then appears as `--profile my-export`. The hooks worth overriding are
 ## Options
 
 ```
-    --skip-empty          leave out sheets with no rows
+    --include-empty       keep sheets with no rows as nodes (off by default)
     --include FILE        text file listing the sheets to read, one per line
 -o, --out PATH            JSON graph path (default: <source name>.json)
     --mermaid PATH        Mermaid ER diagram path (default: beside the JSON)

@@ -41,10 +41,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--json-only", action="store_true", help="write only the JSON, no diagrams"
     )
     p.add_argument(
+        "--include-empty",
+        action="store_true",
+        help="keep sheets with no rows as graph nodes. Off by default: they "
+        "carry no columns, key or references, so they only pad the graph. "
+        "Their names are always listed under empty_sheets.",
+    )
+    p.add_argument(
         "--skip-empty",
         action="store_true",
-        help="leave out sheets with no rows; a full org export ships every "
-        "object definition, and most of them are empty",
+        help=argparse.SUPPRESS,  # now the default; accepted so old commands work
     )
     p.add_argument(
         "--include",
@@ -156,14 +162,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         read_s = time.perf_counter() - started
 
-        skipped_empty = 0
-        if args.skip_empty:
-            kept = [n for n in nodes if n.rows > 0]
-            skipped_empty = len(nodes) - len(kept)
-            nodes = kept
-            log(f"skipped {skipped_empty} empty sheets")
-            if not nodes:
-                raise SystemExit("every sheet was empty; nothing to graph")
+        empty_names = sorted(n.id for n in nodes if n.rows == 0)
+        if not args.include_empty and empty_names:
+            nodes = [n for n in nodes if n.rows > 0]
+            log(f"{len(empty_names)} sheets had no rows, listed under empty_sheets")
+        if not nodes:
+            raise SystemExit("every sheet was empty; nothing to graph")
 
         log("inferring relationships")
         graph = infer(
@@ -173,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
             overlap_threshold=args.overlap_threshold,
         )
         graph.source = str(args.source)
+        graph.empty_sheets = empty_names
         total_rows = sum(n.rows for n in nodes)
         graph.stats = {
             "sheets": len(nodes),
@@ -183,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
             "read_seconds": round(read_s, 2),
             "total_seconds": round(time.perf_counter() - started, 2),
             "sampled": bool(args.max_rows),
-            "skipped_empty": skipped_empty,
+            "empty_sheets": len(empty_names),
             "include_list": str(args.include) if args.include else None,
             "unmatched_include_names": unmatched,
         }
