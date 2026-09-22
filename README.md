@@ -24,11 +24,26 @@ That writes `extract.json` (the graph) and `extract.mmd` (an ER diagram). Hand
 the JSON to an agent, or query it — it carries a `reading_guide` describing its
 own fields, so no other documentation is needed to interpret it.
 
+To cover only the objects a task needs, create a text file listing them, one
+per line:
+
+```text
+# core.txt
+Account
+Contact
+Opportunity
+User
+```
+
 ```bash
-# only the objects a task needs; unlisted files are never read
-printf 'Account\nContact\nOpportunity\nUser\n' > core.txt
 depgraph path/to/extract.ZIP --include core.txt
 ```
+
+Unlisted files are never opened, so this cuts reading time as well as output
+size. Names are matched case-insensitively and any extension is optional, so
+`Account`, `account.csv` and `ACCOUNT.CSV` all select the same object. Blank
+lines and `#` comments are ignored, and any name that matches nothing is
+reported, so a typo cannot silently drop an object.
 
 ## Documentation
 

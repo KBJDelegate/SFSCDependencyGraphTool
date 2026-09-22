@@ -117,15 +117,21 @@ that export they are **287 of 457 edges**, all pointing at `User`, which gives
 `--include` is also the lever for cutting the populated objects down. Give it a text file listing the sheets you
 want, one per line, and everything else is skipped **without being read**:
 
-```bash
-cat > wanted.txt <<'EOF'
-# core objects only
+Create a text file listing the objects, one per line:
+
+```text
+# wanted.txt - core objects only
 Account
 Contact
 Opportunity.xlsx     # the extension is optional
 User
-EOF
 
+# FinServ__Alert__c    <- commented out, so not read
+```
+
+Then point `--include` at it:
+
+```bash
 depgraph extract.ZIP --include wanted.txt
 ```
 
