@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from . import render
-from .ingest import ingest as run_ingest
+from .ingest import filter_members, ingest as run_ingest, list_sources, read_name_filter
 from .infer import infer
 from .profiles import PROFILES, get_profile
 
@@ -36,6 +36,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--json-only", action="store_true", help="skip the two diagram files"
+    )
+    p.add_argument(
+        "--skip-empty",
+        action="store_true",
+        help="leave out sheets with no rows; a full org export ships every "
+        "object definition, and most of them are empty",
+    )
+    p.add_argument(
+        "--include",
+        type=Path,
+        metavar="FILE",
+        help="a text file listing the sheets to read, one per line "
+        "('Account', 'Account.xlsx', blank lines and # comments allowed). "
+        "Everything else is skipped without being read.",
     )
     p.add_argument(
         "--profile",
@@ -100,6 +114,31 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         log(f"reading {args.source} (profile: {profile.name})")
+
+        members = None
+        unmatched: list[str] = []
+        if args.include:
+            if not args.include.exists():
+                print(f"depgraph: {args.include} does not exist", file=sys.stderr)
+                return 2
+            wanted = read_name_filter(args.include)
+            _, discovered = list_sources(args.source)
+            members, unmatched = filter_members(discovered, wanted)
+            log(
+                f"include list: {len(members)} of {len(discovered)} sheets selected"
+            )
+            if unmatched:
+                log(
+                    f"  warning: {len(unmatched)} name(s) matched nothing: "
+                    + ", ".join(unmatched[:10])
+                    + (" ..." if len(unmatched) > 10 else "")
+                )
+            if not members:
+                raise SystemExit(
+                    f"none of the {len(wanted)} names in {args.include} matched a "
+                    f"sheet in {args.source}"
+                )
+
         nodes = run_ingest(
             args.source,
             staging,
@@ -108,8 +147,18 @@ def main(argv: list[str] | None = None) -> int:
             max_rows=args.max_rows,
             sample_n=args.sample,
             progress=progress,
+            members=members,
         )
         read_s = time.perf_counter() - started
+
+        skipped_empty = 0
+        if args.skip_empty:
+            kept = [n for n in nodes if n.rows > 0]
+            skipped_empty = len(nodes) - len(kept)
+            nodes = kept
+            log(f"skipped {skipped_empty} empty sheets")
+            if not nodes:
+                raise SystemExit("every sheet was empty; nothing to graph")
 
         log("inferring relationships")
         graph = infer(
@@ -129,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
             "read_seconds": round(read_s, 2),
             "total_seconds": round(time.perf_counter() - started, 2),
             "sampled": bool(args.max_rows),
+            "skipped_empty": skipped_empty,
+            "include_list": str(args.include) if args.include else None,
+            "unmatched_include_names": unmatched,
         }
 
         out.parent.mkdir(parents=True, exist_ok=True)

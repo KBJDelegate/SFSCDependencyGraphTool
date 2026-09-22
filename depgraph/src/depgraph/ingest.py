@@ -152,6 +152,41 @@ def _pick_key(node_id: str, columns: list[ColumnStats], profile: Profile) -> str
     return None
 
 
+def _norm_name(raw: str) -> str:
+    """Normalise a sheet name for matching: basename, no extension, lowercased.
+
+    So "Account", "account.xlsx" and "exports/Account.XLSX" all match the zip
+    member "Account.xlsx".
+    """
+    name = raw.strip().strip('"').strip("'").replace("\\", "/")
+    name = name.rsplit("/", 1)[-1].lower()
+    for ext in TABULAR:
+        if name.endswith(ext):
+            return name[: -len(ext)]
+    return name
+
+
+def read_name_filter(path: Path) -> set[str]:
+    """Read a plain-text list of wanted sheets, one per line.
+
+    Blank lines are skipped and everything after a '#' is a comment.
+    """
+    wanted: set[str] = set()
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.split("#", 1)[0]
+        name = _norm_name(line)
+        if name:
+            wanted.add(name)
+    return wanted
+
+
+def filter_members(members: list[str], wanted: set[str]) -> tuple[list[str], list[str]]:
+    """(members to read, names in the list that matched nothing)."""
+    kept = [m for m in members if _norm_name(m) in wanted]
+    matched = {_norm_name(m) for m in kept}
+    return kept, sorted(wanted - matched)
+
+
 def list_sources(path: Path) -> tuple[str | None, list[str]]:
     """(zip_path_or_None, members). A directory is read in place, no unpacking."""
     if path.is_dir():
@@ -250,8 +285,11 @@ def ingest(
     max_rows: int | None = None,
     sample_n: int = 500,
     progress=lambda *_: None,
+    members: list[str] | None = None,
 ) -> list[Node]:
-    zip_path, members = list_sources(source)
+    zip_path, discovered = list_sources(source)
+    if members is None:
+        members = discovered
     if not members:
         raise SystemExit(f"no {', '.join(TABULAR)} files found in {source}")
 

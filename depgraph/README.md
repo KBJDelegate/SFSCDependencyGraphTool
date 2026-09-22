@@ -81,6 +81,47 @@ Key fields:
 The `.mmd` and `.dot` files are ER diagrams for humans reviewing what was
 inferred. Dashed DOT edges are `name-only` guesses.
 
+## Narrowing a full org export
+
+A full Salesforce export ships *every* object definition, so most sheets are
+empty and the graph is mostly noise. Two flags cut it down.
+
+`--skip-empty` drops sheets with no rows:
+
+```bash
+depgraph extract.ZIP --skip-empty
+```
+
+On a real 865-sheet export that leaves the 135 objects with data. Note the file
+does not shrink proportionally — empty sheets cost almost nothing, because the
+bytes are in the column metadata of the *populated* objects (2,941 columns
+across those 135). Measured on that export: 584 KB -> 466 KB, a 20% cut. It is
+worth it for navigability, not for size.
+
+`--include` is the real size lever. Give it a text file listing the sheets you
+want, one per line, and everything else is skipped **without being read**:
+
+```bash
+cat > wanted.txt <<'EOF'
+# core objects only
+Account
+Contact
+Opportunity.xlsx     # the extension is optional
+User
+EOF
+
+depgraph extract.ZIP --include wanted.txt
+```
+
+Names are matched case-insensitively against the file name, with any extension
+and directory prefix ignored, so `Account`, `account.xlsx` and
+`exports/ACCOUNT.XLSX` all select the same sheet. Blank lines and `#` comments
+are skipped. Names that match nothing are reported and recorded in
+`stats.unmatched_include_names`, so a typo does not silently drop an object.
+
+For scale, on that same export: the 10 largest objects come to ~78 KB
+(~20k tokens), 20 objects ~154 KB, 40 objects ~237 KB.
+
 ## How it works
 
 Three passes, designed so cost scales with the number of *identifier* columns
@@ -149,6 +190,8 @@ It then appears as `--profile my-export`. The hooks worth overriding are
 ## Options
 
 ```
+    --skip-empty          leave out sheets with no rows
+    --include FILE        text file listing the sheets to read, one per line
 -o, --out PATH            JSON graph path (default: <source name>.json)
     --mermaid PATH        Mermaid ER diagram path (default: beside the JSON)
     --dot PATH            Graphviz DOT diagram path (default: beside the JSON)

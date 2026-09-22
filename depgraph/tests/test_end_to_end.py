@@ -205,6 +205,113 @@ def test_diagrams_render(extract, tmp_path):
     assert dot.count("->") == len(graph.edges)
 
 
+def _with_empty_sheets(extract: Path, dest: Path) -> Path:
+    """Copy the fixture and append header-only sheets, like a real org export."""
+    import xlsxwriter
+
+    work = dest.parent / "empties"
+    work.mkdir(parents=True, exist_ok=True)
+    extras = []
+    for name in ("EmptyObject", "AlsoEmpty__c"):
+        path = work / f"{name}.xlsx"
+        wb = xlsxwriter.Workbook(str(path))
+        ws = wb.add_worksheet(name[:31])
+        for c, h in enumerate(["Id", "Name", "AccountId"]):
+            ws.write(0, c, h)  # headers only, no data rows
+        wb.close()
+        extras.append(path)
+
+    dest.write_bytes(extract.read_bytes())
+    with zipfile.ZipFile(dest, "a", zipfile.ZIP_DEFLATED) as zf:
+        for path in extras:
+            zf.write(path, arcname=path.name)
+    return dest
+
+
+def test_empty_sheets_are_kept_by_default(extract, tmp_path):
+    src = _with_empty_sheets(extract, tmp_path / "e.zip")
+    g = run(src, tmp_path / "keep")
+    ids = {n["id"] for n in g["nodes"]}
+    assert {"EmptyObject", "AlsoEmpty__c"} <= ids
+    empty = next(n for n in g["nodes"] if n["id"] == "EmptyObject")
+    assert "rows" not in empty or empty["rows"] == 0
+    assert empty["warnings"] == ["empty sheet"]
+
+
+def test_skip_empty_drops_them(extract, tmp_path):
+    src = _with_empty_sheets(extract, tmp_path / "e2.zip")
+    out = tmp_path / "se.json"
+    assert main([str(src), "-o", str(out), "--skip-empty", "-q"]) == 0
+    g = json.loads(out.read_text())
+    ids = {n["id"] for n in g["nodes"]}
+    assert not ({"EmptyObject", "AlsoEmpty__c"} & ids)
+    assert g["stats"]["skipped_empty"] == 2
+    # Dropping empties must not change the real relationships.
+    assert {(e["from"], e["to"]) for e in g["edges"]} == EXPECTED
+    assert all(n not in ids for n in ("EmptyObject", "AlsoEmpty__c"))
+    # ...nor leave them in the load order.
+    assert "EmptyObject" not in {n for layer in g["load_order"] for n in layer}
+
+
+def test_include_list_reads_only_the_named_sheets(extract, tmp_path):
+    lst = tmp_path / "wanted.txt"
+    lst.write_text(
+        "# objects we care about\n"
+        "Account\n"
+        "contact.xlsx\n"          # extension and case are both ignored
+        "\n"
+        "  User  \n"
+    )
+    out = tmp_path / "inc.json"
+    assert main([str(extract), "-o", str(out), "--include", str(lst), "-q"]) == 0
+    g = json.loads(out.read_text())
+    assert {n["id"] for n in g["nodes"]} == {"Account", "Contact", "User"}
+    # Opportunity was never read, so nothing references it.
+    assert not any("Opportunity" in e["to"] for e in g["edges"])
+    assert ("Contact.AccountId", "Account.Id") in {
+        (e["from"], e["to"]) for e in g["edges"]
+    }
+    assert g["stats"]["sheets"] == 3
+
+
+def test_include_list_reports_names_that_matched_nothing(extract, tmp_path):
+    lst = tmp_path / "typos.txt"
+    lst.write_text("Account\nAccuont\nNoSuchObject\n")
+    out = tmp_path / "u.json"
+    assert main([str(extract), "-o", str(out), "--include", str(lst), "-q"]) == 0
+    g = json.loads(out.read_text())
+    assert g["stats"]["unmatched_include_names"] == ["accuont", "nosuchobject"]
+    assert {n["id"] for n in g["nodes"]} == {"Account"}
+
+
+def test_include_list_matching_nothing_is_a_clean_error(extract, tmp_path):
+    lst = tmp_path / "none.txt"
+    lst.write_text("Nonexistent\n")
+    with pytest.raises(SystemExit):
+        main([str(extract), "-o", str(tmp_path / "x.json"), "--include", str(lst), "-q"])
+
+
+def test_missing_include_file_is_a_clean_error(extract, tmp_path):
+    rc = main(
+        [str(extract), "-o", str(tmp_path / "x.json"), "--include",
+         str(tmp_path / "nope.txt"), "-q"]
+    )
+    assert rc == 2
+
+
+def test_include_and_skip_empty_combine(extract, tmp_path):
+    src = _with_empty_sheets(extract, tmp_path / "e3.zip")
+    lst = tmp_path / "w.txt"
+    lst.write_text("Account\nContact\nEmptyObject\n")
+    out = tmp_path / "both.json"
+    assert main(
+        [str(src), "-o", str(out), "--include", str(lst), "--skip-empty", "-q"]
+    ) == 0
+    g = json.loads(out.read_text())
+    assert {n["id"] for n in g["nodes"]} == {"Account", "Contact"}
+    assert g["stats"]["skipped_empty"] == 1
+
+
 def test_cycles_are_detected_and_reported():
     nodes = [Node(id=n, source="x", sheet="x", rows=1) for n in ("A", "B", "C")]
     graph = Graph(nodes=nodes)
