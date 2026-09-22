@@ -9,9 +9,9 @@ ids. This works them out from three independent signals (the object key prefix
 inside each id, the column name, and an actual join of the values), and records
 which of them fired for every relationship it reports.
 
-Measured on a real 865-sheet org export: **~2 GB of CSV reduced to a 476 KB
-graph in 58 seconds**, covering 135 populated objects, 2,941 columns and 457
-verified relationships.
+Measured on a real 865-sheet org export: **~2 GB of CSV reduced to a 500 KB
+graph in under a minute**, covering 135 populated objects, 2,941 columns and
+457 relationships, every one of them verified against the data.
 
 ## Quick start
 
