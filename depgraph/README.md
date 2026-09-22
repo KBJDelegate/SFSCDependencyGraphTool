@@ -53,8 +53,8 @@ does not need this README:
   ],
   "edges": [
     {"from": "Contact.AccountId", "to": "Account.Id", "kind": "lookup",
-     "cardinality": "N:1", "confidence": 0.99, "resolve_rate": 0.9795,
-     "null_pct": 0.0299,
+     "cardinality": "N:1", "confidence": 0.986, "resolve_rate": 0.9795,
+     "verified": true, "null_pct": 0.0299,
      "evidence": ["key prefix 001 matches Account.Id",
                   "column name implies Account",
                   "285,050/291,017 references resolve (97.9%)"]}
@@ -70,8 +70,9 @@ Key fields:
 
 | Field | Meaning |
 |---|---|
-| `resolve_rate` | Measured share of non-null source values found in the target key. `1.0` = every reference verified against real rows. |
-| `confidence` | `resolve_rate` combined with the naming and key-prefix signals listed in `evidence`. |
+| `resolve_rate` | **The authority on reliability.** Measured share of non-null source values found in the target key. `1.0` = every reference verified against real rows. |
+| `verified` | `resolve_rate >= 0.9` — the relationship is proven by data. Report these as established, not as likely. |
+| `confidence` | Only ranks *how the target was identified*. Below 1.0 does **not** mean unverified: an edge loses a little merely because the column name lacks the target's name. Judge reliability from `resolve_rate`. |
 | `kind` | `lookup`, `self` (self-reference), or `name-only` (names line up, no value matched — a guess). |
 | `polymorphic_group` | One column pointing at several tables (`Task.WhatId` → Account *and* Opportunity). |
 | `load_order` | Tables in dependency order, targets first. The last layer holds anything unorderable because of a cycle. |
@@ -121,6 +122,17 @@ are skipped. Names that match nothing are reported and recorded in
 
 For scale, on that same export: the 10 largest objects come to ~78 KB
 (~20k tokens), 20 objects ~154 KB, 40 objects ~237 KB.
+
+## Reading confidence correctly
+
+`resolve_rate` is the reliability signal; `confidence` only ranks how the target
+was identified. They are separate on purpose, because blending them misleads:
+`Lead.ConvertedAccountId` resolves **100%** to `Account.Id` yet shares no name
+with it, so a naming-weighted score made a fully proven edge look like a guess.
+Scoring is `0.70*resolve + 0.20*key-prefix + 0.05*name + 0.05*suffix`, so the
+measured data dominates. Use `verified` (`resolve_rate >= 0.9`) as the yes/no.
+
+Only `kind: "name-only"` is a genuine guess — there, nothing resolved at all.
 
 ## How it works
 

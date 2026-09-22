@@ -17,14 +17,23 @@ from .model import Graph
 SCHEMA_VERSION = "1.0"
 
 READING_GUIDE = (
-    "nodes[] are tables (one per sheet); edges[] are inferred references. "
-    "resolve_rate is the measured share of non-null source values found in the "
-    "target key, so 1.0 means every reference was verified against real data. "
-    "confidence combines resolve_rate with the naming and key-prefix signals in "
-    "evidence[]. kind='name-only' means the names line up but no value matched, "
-    "so treat it as a guess. polymorphic_group marks one column that points at "
-    "several tables. load_order lists tables in dependency order, targets first. "
-    "unresolved[] are references pointing outside this extract."
+    "nodes[] are tables (one per sheet); edges[] are references between them. "
+    "READ THIS BEFORE JUDGING RELIABILITY: resolve_rate is the authority. It is "
+    "the measured share of non-null source values actually found in the target "
+    "key, so 1.0 means every single reference was checked against real rows. "
+    "verified=true means resolve_rate >= 0.9, i.e. the relationship is proven by "
+    "data; report it as established, not as likely. A confidence below 1.0 does "
+    "NOT mean unverified: confidence only ranks how the target was identified, "
+    "and an edge loses a little of it merely because the column name does not "
+    "contain the target's name (Lead.ConvertedAccountId resolves 100% to "
+    "Account.Id but shares no name with it). Only kind='name-only' is a guess - "
+    "there, nothing resolved. Where resolve_rate is between 0 and 0.9 the "
+    "relationship is real but some rows point at records missing from the "
+    "extract. polymorphic_group marks one column pointing at several tables. "
+    "load_order lists tables in dependency order, targets first; its last layer "
+    "holds anything unorderable because of cycles[]. unresolved[] are references "
+    "pointing outside this extract, which are not errors. Sheets with rows=0 are "
+    "empty object definitions shipped by the export; filter them out."
 )
 
 
@@ -34,7 +43,8 @@ def _clean(obj):
         return {
             k: _clean(v)
             for k, v in obj.items()
-            if v not in (None, "", [], {}, 0, 0.0) or k in ("rows", "confidence")
+            if v not in (None, "", [], {}, 0, 0.0)
+            or k in ("rows", "confidence", "verified")
         }
     if isinstance(obj, list):
         return [_clean(v) for v in obj]
@@ -89,6 +99,7 @@ def to_dict(graph: Graph) -> dict:
             "cardinality": e.cardinality,
             "confidence": e.confidence,
             "resolve_rate": e.resolve_rate,
+            "verified": e.verified,
             "null_pct": e.null_pct,
             "polymorphic_group": e.polymorphic_group,
             "evidence": e.evidence,

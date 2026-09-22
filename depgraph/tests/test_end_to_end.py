@@ -114,6 +114,39 @@ def test_self_references_are_marked_but_do_not_create_cycles(sf):
     assert selfies == {"Account.ParentId", "Contact.ReportsToId", "User.ManagerId"}
 
 
+def test_fully_resolved_edges_are_marked_verified(sf):
+    """Every fixture reference points at a real row, so nothing is a guess."""
+    assert all(e["verified"] for e in sf["edges"])
+    assert all(e["kind"] != "name-only" for e in sf["edges"])
+
+
+def test_a_missing_name_hint_does_not_look_like_doubt(sf):
+    """The bug this guards: Primary_Contact__c resolves 100% to Contact.Id but
+    shares no name with it. It must not be scored down into 'uncertain'."""
+    e = next(
+        x for x in sf["edges"] if x["from"] == "Custom_Project__c.Primary_Contact__c"
+    )
+    assert e["resolve_rate"] == 1.0
+    assert e["verified"] is True
+    assert e["confidence"] >= 0.95, "a proven edge must not read as a guess"
+    assert not any("column name implies" in ev for ev in e["evidence"])
+
+
+def test_partially_resolved_edges_are_not_marked_verified():
+    from depgraph.infer import VERIFIED_AT, _score
+
+    assert _score(1.0, True, False, True) >= 0.95
+    assert _score(0.4, True, True, True) < _score(1.0, True, False, True)
+    assert VERIFIED_AT == 0.9
+
+
+def test_reading_guide_explains_verified_and_confidence(sf):
+    guide = sf["reading_guide"]
+    assert "resolve_rate is the authority" in guide
+    assert "does NOT mean unverified" in guide
+    assert "verified=true" in guide
+
+
 def test_columns_carry_an_inline_ref_pointer(sf):
     contact = next(n for n in sf["nodes"] if n["id"] == "Contact")
     account_id = next(c for c in contact["columns"] if c["name"] == "AccountId")

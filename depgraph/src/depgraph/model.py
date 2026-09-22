@@ -61,6 +61,9 @@ class Edge:
     confidence: float
     resolve_rate: float
     null_pct: float
+    #: True when the references were actually found in the target key, i.e. the
+    #: relationship is proven by data rather than inferred from naming.
+    verified: bool = False
     evidence: list[str] = field(default_factory=list)
     polymorphic_group: str | None = None
 

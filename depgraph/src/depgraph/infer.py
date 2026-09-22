@@ -33,11 +33,23 @@ def _resolve(src_path: str, tgt_path: str, token: str | None) -> tuple[float, in
     return matched / total, matched, total
 
 
+#: At or above this resolve rate the relationship is treated as proven. Orphan
+#: rows below it are a data-quality question, not a doubt about the schema.
+VERIFIED_AT = 0.9
+
+
 def _score(resolve: float, token_match: bool, name_match: bool, suffix: bool) -> float:
+    """Confidence that this is the right target.
+
+    The measured resolve rate dominates deliberately: whether a column *name*
+    happens to contain the target's name is cosmetic, and weighting it heavily
+    made fully-resolved edges look uncertain (Lead.ConvertedAccountId resolves
+    100% but shares no name with Account).
+    """
     conf = (
-        0.50 * resolve
-        + 0.30 * float(token_match)
-        + 0.15 * float(name_match)
+        0.70 * resolve
+        + 0.20 * float(token_match)
+        + 0.05 * float(name_match)
         + 0.05 * float(suffix)
     )
     return round(min(conf, 0.99), 3)
@@ -201,6 +213,7 @@ def infer(
                     confidence=conf,
                     resolve_rate=round(rate, 4),
                     null_pct=round(col.nulls / max(col.rows, 1), 4),
+                    verified=rate >= VERIFIED_AT,
                     evidence=ev,
                     polymorphic_group=group,
                 )
