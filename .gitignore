@@ -6,6 +6,10 @@ graph.mmd
 graph.dot
 *.mmd
 *.dot
+# Outputs are named after the source extract, so the JSON name is not known in
+# advance. Ignore JSON at the repo root, where runs land; committed config
+# lives in subdirectories (.devcontainer/, depgraph/) and is unaffected.
+/*.json
 
 # ---------------------------------------------------------------------------
 # Salesforce extracts — real customer data, never commit
