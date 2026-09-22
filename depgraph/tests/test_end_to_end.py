@@ -314,6 +314,28 @@ def test_skip_empty_is_still_accepted_as_a_no_op(extract, tmp_path):
     assert not ({"EmptyObject", "AlsoEmpty__c"} & {n["id"] for n in g["nodes"]})
 
 
+def test_empty_csv_sheets_are_dropped_too(tmp_path):
+    """A CSV export signals 'empty' with a header-only or zero-byte file."""
+    src = tmp_path / "csv.zip"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("User.csv", "Id,Name\n005A00000000001,Ann\n005A00000000002,Bo\n")
+        zf.writestr(
+            "Account.csv",
+            "Id,Name,OwnerId\n"
+            "001A00000000001,One,005A00000000001\n"
+            "001A00000000002,Two,005A00000000002\n",
+        )
+        zf.writestr("Case.csv", "Id,CaseNumber,AccountId\n")  # header only
+        zf.writestr("Tombstone.csv", "")  # zero bytes
+
+    out = tmp_path / "c.json"
+    assert main([str(src), "-o", str(out), "-q"]) == 0
+    g = json.loads(out.read_text())
+    assert {n["id"] for n in g["nodes"]} == {"Account", "User"}
+    assert ("Account.OwnerId", "User.Id") in {(e["from"], e["to"]) for e in g["edges"]}
+    assert "Case" not in (tmp_path / "c.mmd").read_text()
+
+
 def test_include_list_reads_only_the_named_sheets(extract, tmp_path):
     lst = tmp_path / "wanted.txt"
     lst.write_text(
