@@ -158,6 +158,40 @@ def test_max_rows_sampling_is_faster_and_flagged(extract, tmp_path):
     assert g["stats"]["rows"] < 7300
 
 
+def test_defaults_name_every_output_after_the_source(extract, tmp_path, monkeypatch):
+    """A bare `depgraph extract.zip` writes all three files, no flags needed."""
+    work = tmp_path / "work"
+    work.mkdir()
+    src = work / "my-export.zip"
+    src.write_bytes(extract.read_bytes())
+    monkeypatch.chdir(work)
+
+    assert main(["my-export.zip", "-q"]) == 0
+    assert (work / "my-export.json").exists()
+    assert (work / "my-export.mmd").read_text().startswith("erDiagram")
+    assert (work / "my-export.dot").read_text().startswith("digraph")
+
+
+def test_json_only_skips_the_diagrams(extract, tmp_path, monkeypatch):
+    work = tmp_path / "jo"
+    work.mkdir()
+    (work / "e.zip").write_bytes(extract.read_bytes())
+    monkeypatch.chdir(work)
+
+    assert main(["e.zip", "--json-only", "-q"]) == 0
+    assert (work / "e.json").exists()
+    assert not (work / "e.mmd").exists()
+    assert not (work / "e.dot").exists()
+
+
+def test_explicit_out_places_diagrams_beside_it(extract, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main([str(extract), "-o", "nested/g.json", "-q"]) == 0
+    assert (tmp_path / "nested" / "g.json").exists()
+    assert (tmp_path / "nested" / "g.mmd").exists()
+    assert (tmp_path / "nested" / "g.dot").exists()
+
+
 def test_diagrams_render(extract, tmp_path):
     nodes = ingest(extract, tmp_path / "stg", "salesforce", workers=1)
     graph = infer(nodes, get_profile("salesforce"))

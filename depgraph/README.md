@@ -8,14 +8,19 @@ Salesforce knowledge lives in a swappable **profile**, so the same engine works
 on any zip or directory of sheets.
 
 ```bash
-uv run depgraph extract.zip -o graph.json --mermaid graph.mmd
+uv run depgraph extract.zip
 ```
 
 ```
 6 sheets / 1,175,000 rows / 38 columns in 3.04s
 16 relationships, 3 pointing outside the extract
-wrote graph.json (11,599 bytes)
+wrote big.json (11,599 bytes)
+wrote big.mmd (1,110 bytes)
+wrote big.dot (1,448 bytes)
 ```
+
+Every output is named after the source, so there is nothing to pass. Use `-o`
+to put the JSON elsewhere (the diagrams follow it) or `--json-only` to skip them.
 
 The output size tracks the **schema**, not the data: that 1.2M-row extract and a
 7,300-row one both produce an ~11 KB graph, small enough to paste into a prompt.
@@ -73,7 +78,7 @@ Key fields:
 | `unresolved` | References pointing outside the extract, named where the prefix is a known standard object. |
 | `ref` (on a column) | Denormalised pointer, so a column answers "what does this point at" without cross-referencing `edges`. |
 
-`--mermaid` and `--dot` write ER diagrams for humans reviewing what was
+The `.mmd` and `.dot` files are ER diagrams for humans reviewing what was
 inferred. Dashed DOT edges are `name-only` guesses.
 
 ## How it works
@@ -144,9 +149,10 @@ It then appears as `--profile my-export`. The hooks worth overriding are
 ## Options
 
 ```
--o, --out PATH            JSON graph output (default: depgraph.json)
-    --mermaid PATH        also write a Mermaid ER diagram
-    --dot PATH            also write a Graphviz DOT diagram
+-o, --out PATH            JSON graph path (default: <source name>.json)
+    --mermaid PATH        Mermaid ER diagram path (default: beside the JSON)
+    --dot PATH            Graphviz DOT diagram path (default: beside the JSON)
+    --json-only           skip the two diagram files
     --profile NAME        export dialect (default: salesforce)
 -j, --workers N           parallel readers (default: cpus)
     --max-rows N          read at most N rows per sheet (approximate stats)

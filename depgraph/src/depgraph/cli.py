@@ -23,10 +23,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("source", type=Path, help="extract .zip, or a directory of sheets")
     p.add_argument(
-        "-o", "--out", type=Path, default=Path("depgraph.json"), help="JSON graph output"
+        "-o",
+        "--out",
+        type=Path,
+        help="JSON graph path (default: <source name>.json in the current directory)",
     )
-    p.add_argument("--mermaid", type=Path, help="also write a Mermaid ER diagram")
-    p.add_argument("--dot", type=Path, help="also write a Graphviz DOT diagram")
+    p.add_argument(
+        "--mermaid", type=Path, help="Mermaid ER diagram path (default: beside the JSON)"
+    )
+    p.add_argument(
+        "--dot", type=Path, help="Graphviz DOT diagram path (default: beside the JSON)"
+    )
+    p.add_argument(
+        "--json-only", action="store_true", help="skip the two diagram files"
+    )
     p.add_argument(
         "--profile",
         default="salesforce",
@@ -73,6 +83,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"depgraph: {args.source} does not exist", file=sys.stderr)
         return 2
 
+    # By default every output is named after the source, so a bare
+    # `depgraph extract.zip` writes extract.json, extract.mmd and extract.dot.
+    out = args.out or Path(f"{args.source.stem or args.source.name}.json")
+    mermaid = args.mermaid or (None if args.json_only else out.with_suffix(".mmd"))
+    dot = args.dot or (None if args.json_only else out.with_suffix(".dot"))
+
     profile = get_profile(args.profile)
     log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr))
 
@@ -115,21 +131,19 @@ def main(argv: list[str] | None = None) -> int:
             "sampled": bool(args.max_rows),
         }
 
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
             render.to_json(graph, indent=args.indent or None), encoding="utf-8"
         )
-        written = [args.out]
-        if args.mermaid:
-            args.mermaid.write_text(
+        written = [out]
+        if mermaid:
+            mermaid.write_text(
                 render.to_mermaid(graph, args.min_confidence), encoding="utf-8"
             )
-            written.append(args.mermaid)
-        if args.dot:
-            args.dot.write_text(
-                render.to_dot(graph, args.min_confidence), encoding="utf-8"
-            )
-            written.append(args.dot)
+            written.append(mermaid)
+        if dot:
+            dot.write_text(render.to_dot(graph, args.min_confidence), encoding="utf-8")
+            written.append(dot)
     finally:
         if not args.keep_staging and args.staging is None:
             shutil.rmtree(staging, ignore_errors=True)
