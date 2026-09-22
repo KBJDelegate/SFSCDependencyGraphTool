@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+# generated output
+depgraph.json
+*-sheets/
+fixture-extract.zip

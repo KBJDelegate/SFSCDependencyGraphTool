@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import json
+import sys
+import zipfile
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent))
+from make_fixture import build  # noqa: E402
+
+from depgraph import get_profile, infer, ingest, to_dot, to_mermaid  # noqa: E402
+from depgraph.cli import main  # noqa: E402
+from depgraph.infer import _topology  # noqa: E402
+from depgraph.model import Edge, Graph, Node  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def extract(tmp_path_factory) -> Path:
+    return build(tmp_path_factory.mktemp("fx") / "extract.zip")
+
+
+def run(source: Path, tmp_path: Path, profile: str = "salesforce") -> dict:
+    out = tmp_path / "graph.json"
+    assert main([str(source), "-o", str(out), "--profile", profile, "-q"]) == 0
+    return json.loads(out.read_text())
+
+
+@pytest.fixture(scope="session")
+def sf(extract, tmp_path_factory) -> dict:
+    return run(extract, tmp_path_factory.mktemp("sf"))
+
+
+EXPECTED = {
+    ("Account.OwnerId", "User.Id"),
+    ("Account.ParentId", "Account.Id"),
+    ("Contact.AccountId", "Account.Id"),
+    ("Contact.OwnerId", "User.Id"),
+    ("Contact.CreatedById", "User.Id"),
+    ("Contact.ReportsToId", "Contact.Id"),
+    ("Opportunity.AccountId", "Account.Id"),
+    ("Opportunity.OwnerId", "User.Id"),
+    ("Task.OwnerId", "User.Id"),
+    ("Task.WhatId", "Account.Id"),
+    ("Task.WhatId", "Opportunity.Id"),
+    ("Task.WhoId", "Contact.Id"),
+    ("User.ManagerId", "User.Id"),
+    ("Custom_Project__c.Account__c", "Account.Id"),
+    ("Custom_Project__c.OwnerId", "User.Id"),
+    ("Custom_Project__c.Primary_Contact__c", "Contact.Id"),
+}
+
+
+def test_finds_exactly_the_real_relationships(sf):
+    found = {(e["from"], e["to"]) for e in sf["edges"]}
+    assert found == EXPECTED
+
+
+def test_every_sheet_becomes_a_node_with_a_key(sf):
+    assert {n["id"] for n in sf["nodes"]} == {
+        "Account", "Contact", "Opportunity", "User", "Task", "Custom_Project__c"
+    }
+    assert all(n["key"] == "Id" for n in sf["nodes"])
+    assert not any(n.get("warnings") for n in sf["nodes"])
+
+
+def test_key_prefixes_are_detected(sf):
+    tokens = {n["id"]: n.get("key_token") for n in sf["nodes"]}
+    assert tokens["Account"] == "001"
+    assert tokens["Contact"] == "003"
+    assert tokens["User"] == "005"
+    assert tokens["Custom_Project__c"] == "a01"
+
+
+def test_dangling_references_lower_the_resolve_rate(sf):
+    """The fixture plants ~2% ids that look real but match no Account row."""
+    edge = next(e for e in sf["edges"] if e["from"] == "Contact.AccountId")
+    assert 0.9 < edge["resolve_rate"] < 1.0
+    assert edge["null_pct"] > 0
+    clean = next(e for e in sf["edges"] if e["from"] == "Opportunity.AccountId")
+    assert clean["resolve_rate"] == 1.0
+
+
+def test_polymorphic_columns_are_grouped(sf):
+    what = [e for e in sf["edges"] if e["from"] == "Task.WhatId"]
+    assert {e["to"] for e in what} == {"Account.Id", "Opportunity.Id"}
+    assert len({e["polymorphic_group"] for e in what}) == 1
+    # WhoId points at Contact and Lead; Lead is absent but it is still polymorphic.
+    who = next(e for e in sf["edges"] if e["from"] == "Task.WhoId")
+    assert who["polymorphic_group"] == "Task.WhoId"
+
+
+def test_references_outside_the_extract_are_reported(sf):
+    unresolved = {(u["from"], u["token"]) for u in sf["unresolved"]}
+    assert ("User.ProfileId", "00e") in unresolved
+    assert ("Opportunity.Pricebook2Id", "01s") in unresolved
+    assert ("Task.WhoId", "00Q") in unresolved
+    lead = next(u for u in sf["unresolved"] if u["token"] == "00Q")
+    assert "Lead" in lead["reason"]
+
+
+def test_load_order_respects_dependencies(sf):
+    order = sf["load_order"]
+    depth = {n: i for i, layer in enumerate(order) for n in layer}
+    assert depth["User"] < depth["Account"] < depth["Contact"]
+    assert depth["Account"] < depth["Opportunity"]
+    assert depth["Contact"] < depth["Custom_Project__c"]
+    assert not sf.get("cycles")
+
+
+def test_self_references_are_marked_but_do_not_create_cycles(sf):
+    selfies = {e["from"] for e in sf["edges"] if e["kind"] == "self"}
+    assert selfies == {"Account.ParentId", "Contact.ReportsToId", "User.ManagerId"}
+
+
+def test_columns_carry_an_inline_ref_pointer(sf):
+    contact = next(n for n in sf["nodes"] if n["id"] == "Contact")
+    account_id = next(c for c in contact["columns"] if c["name"] == "AccountId")
+    assert account_id["ref"] == "Account.Id"
+    assert account_id["type"] == "id"
+    # Non-identifier columns are still described, for schema questions.
+    email = next(c for c in contact["columns"] if c["name"] == "Email")
+    assert email["type"] == "string" and "ref" not in email
+
+
+def test_json_stays_small_and_self_describing(sf, extract):
+    assert "reading_guide" in sf and "resolve_rate" in sf["reading_guide"]
+    assert sf["stats"]["rows"] == 7300
+    assert sf["profile"] == "salesforce"
+
+
+def test_generic_profile_works_without_salesforce_knowledge(extract, tmp_path):
+    g = run(extract, tmp_path, profile="generic")
+    found = {(e["from"], e["to"]) for e in g["edges"]}
+    assert found <= EXPECTED, "generic must not invent edges the data disproves"
+    assert ("Contact.AccountId", "Account.Id") in found
+    assert ("Account.ParentId", "Account.Id") in found
+    assert len(found) >= 12
+    # Weaker signals must score lower than the prefix-backed ones.
+    assert max(e["confidence"] for e in g["edges"]) < 0.99
+
+
+def test_directory_input_matches_zip_input(extract, tmp_path):
+    unzipped = tmp_path / "sheets"
+    unzipped.mkdir()
+    with zipfile.ZipFile(extract) as zf:
+        zf.extractall(unzipped)
+    from_dir = run(unzipped, tmp_path / "d")
+    assert {(e["from"], e["to"]) for e in from_dir["edges"]} == EXPECTED
+
+
+def test_max_rows_sampling_is_faster_and_flagged(extract, tmp_path):
+    out = tmp_path / "s.json"
+    assert main([str(extract), "-o", str(out), "--max-rows", "50", "-q"]) == 0
+    g = json.loads(out.read_text())
+    assert g["stats"]["sampled"] is True
+    assert g["stats"]["rows"] < 7300
+
+
+def test_diagrams_render(extract, tmp_path):
+    nodes = ingest(extract, tmp_path / "stg", "salesforce", workers=1)
+    graph = infer(nodes, get_profile("salesforce"))
+    mmd = to_mermaid(graph)
+    assert mmd.startswith("erDiagram")
+    assert "Account" in mmd and "||--o{" in mmd
+    # Mermaid entity names must not contain characters it cannot parse.
+    assert "__c" not in mmd.split("\n")[1] or "Custom_Project__c" in mmd
+    dot = to_dot(graph)
+    assert dot.startswith("digraph") and dot.rstrip().endswith("}")
+    assert dot.count("->") == len(graph.edges)
+
+
+def test_cycles_are_detected_and_reported():
+    nodes = [Node(id=n, source="x", sheet="x", rows=1) for n in ("A", "B", "C")]
+    graph = Graph(nodes=nodes)
+    graph.edges = [
+        Edge("A", "b_id", "B", "Id", "lookup", "N:1", 0.9, 1.0, 0.0),
+        Edge("B", "a_id", "A", "Id", "lookup", "N:1", 0.9, 1.0, 0.0),
+        Edge("C", "a_id", "A", "Id", "lookup", "N:1", 0.9, 1.0, 0.0),
+    ]
+    layers, cycles = _topology(graph)
+    assert cycles == [["A", "B"]]
+    # C is not itself in the cycle, but it depends on A, so it cannot be
+    # ordered either; everything unorderable lands in the final layer.
+    assert sorted(layers[-1]) == ["A", "B", "C"]
+    assert len(layers) == 1
+
+
+def test_missing_source_is_a_clean_error(tmp_path):
+    assert main([str(tmp_path / "nope.zip"), "-o", str(tmp_path / "o.json")]) == 2
+
+
+def test_empty_zip_is_a_clean_error(tmp_path):
+    empty = tmp_path / "empty.zip"
+    with zipfile.ZipFile(empty, "w") as zf:
+        zf.writestr("readme.txt", "nothing tabular here")
+    with pytest.raises(SystemExit):
+        main([str(empty), "-o", str(tmp_path / "o.json"), "-q"])
