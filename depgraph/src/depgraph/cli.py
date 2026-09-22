@@ -32,10 +32,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--mermaid", type=Path, help="Mermaid ER diagram path (default: beside the JSON)"
     )
     p.add_argument(
-        "--dot", type=Path, help="Graphviz DOT diagram path (default: beside the JSON)"
+        "--dot",
+        type=Path,
+        metavar="PATH",
+        help="also write a Graphviz DOT diagram here (off unless asked for)",
     )
     p.add_argument(
-        "--json-only", action="store_true", help="skip the two diagram files"
+        "--json-only", action="store_true", help="write only the JSON, no diagrams"
     )
     p.add_argument(
         "--skip-empty",
@@ -97,11 +100,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"depgraph: {args.source} does not exist", file=sys.stderr)
         return 2
 
-    # By default every output is named after the source, so a bare
-    # `depgraph extract.zip` writes extract.json, extract.mmd and extract.dot.
+    # By default the outputs are named after the source, so a bare
+    # `depgraph extract.zip` writes extract.json and extract.mmd. DOT is opt-in.
     out = args.out or Path(f"{args.source.stem or args.source.name}.json")
-    mermaid = args.mermaid or (None if args.json_only else out.with_suffix(".mmd"))
-    dot = args.dot or (None if args.json_only else out.with_suffix(".dot"))
+    mermaid = args.mermaid or out.with_suffix(".mmd")
+    dot = args.dot
+    if args.json_only:
+        mermaid = dot = None
 
     profile = get_profile(args.profile)
     log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr))

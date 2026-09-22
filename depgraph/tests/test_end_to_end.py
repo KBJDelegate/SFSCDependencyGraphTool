@@ -202,7 +202,14 @@ def test_defaults_name_every_output_after_the_source(extract, tmp_path, monkeypa
     assert main(["my-export.zip", "-q"]) == 0
     assert (work / "my-export.json").exists()
     assert (work / "my-export.mmd").read_text().startswith("erDiagram")
-    assert (work / "my-export.dot").read_text().startswith("digraph")
+    # DOT is opt-in, not a default output.
+    assert not (work / "my-export.dot").exists()
+
+
+def test_dot_is_written_only_when_asked_for(extract, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main([str(extract), "-o", "g.json", "--dot", "g.dot", "-q"]) == 0
+    assert (tmp_path / "g.dot").read_text().startswith("digraph")
 
 
 def test_json_only_skips_the_diagrams(extract, tmp_path, monkeypatch):
@@ -222,7 +229,7 @@ def test_explicit_out_places_diagrams_beside_it(extract, tmp_path, monkeypatch):
     assert main([str(extract), "-o", "nested/g.json", "-q"]) == 0
     assert (tmp_path / "nested" / "g.json").exists()
     assert (tmp_path / "nested" / "g.mmd").exists()
-    assert (tmp_path / "nested" / "g.dot").exists()
+    assert not (tmp_path / "nested" / "g.dot").exists()
 
 
 def test_diagrams_render(extract, tmp_path):

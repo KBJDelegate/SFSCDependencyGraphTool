@@ -16,7 +16,6 @@ uv run depgraph extract.zip
 16 relationships, 3 pointing outside the extract
 wrote big.json (11,599 bytes)
 wrote big.mmd (1,110 bytes)
-wrote big.dot (1,448 bytes)
 ```
 
 Every output is named after the source, so there is nothing to pass. Use `-o`
@@ -79,8 +78,9 @@ Key fields:
 | `unresolved` | References pointing outside the extract, named where the prefix is a known standard object. |
 | `ref` (on a column) | Denormalised pointer, so a column answers "what does this point at" without cross-referencing `edges`. |
 
-The `.mmd` and `.dot` files are ER diagrams for humans reviewing what was
-inferred. Dashed DOT edges are `name-only` guesses.
+The `.mmd` file is a Mermaid ER diagram for humans reviewing what was inferred;
+it renders inline on GitHub and in most markdown viewers. Pass `--dot PATH` if
+you also want Graphviz DOT, where dashed edges are `name-only` guesses.
 
 ## Narrowing a full org export
 
@@ -206,8 +206,8 @@ It then appears as `--profile my-export`. The hooks worth overriding are
     --include FILE        text file listing the sheets to read, one per line
 -o, --out PATH            JSON graph path (default: <source name>.json)
     --mermaid PATH        Mermaid ER diagram path (default: beside the JSON)
-    --dot PATH            Graphviz DOT diagram path (default: beside the JSON)
-    --json-only           skip the two diagram files
+    --dot PATH            also write a Graphviz DOT diagram (off by default)
+    --json-only           write only the JSON, no diagrams
     --profile NAME        export dialect (default: salesforce)
 -j, --workers N           parallel readers (default: cpus)
     --max-rows N          read at most N rows per sheet (approximate stats)
