@@ -12,9 +12,10 @@ import json
 import re
 from collections import defaultdict
 
+from . import __version__
 from .model import Graph
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 READING_GUIDE = (
     "nodes[] are tables (one per sheet); edges[] are references between them. "
@@ -35,7 +36,8 @@ READING_GUIDE = (
     "together in cycles[] means they reference each other circularly and have "
     "to be handled as one unit. unresolved[] are references "
     "pointing outside this extract, which are not errors. Sheets the export "
-    "shipped with no rows are excluded entirely."
+    "shipped with no rows are excluded entirely. A node with parts[] was split "
+    "across several files of the export and has been merged into one table."
 )
 
 
@@ -84,6 +86,8 @@ def to_dict(graph: Graph) -> dict:
             {
                 "id": n.id,
                 "source": n.source,
+                # Only when the export split the object across several files.
+                "parts": n.parts if len(n.parts) > 1 else None,
                 "sheet": n.sheet if n.sheet != n.id else None,
                 "rows": n.rows,
                 "key": n.key,
@@ -112,7 +116,7 @@ def to_dict(graph: Graph) -> dict:
     return _clean(
         {
             "schema_version": SCHEMA_VERSION,
-            "generator": "depgraph 0.1.0",
+            "generator": f"depgraph {__version__}",
             "profile": graph.profile,
             "source": graph.source,
             "stats": graph.stats,

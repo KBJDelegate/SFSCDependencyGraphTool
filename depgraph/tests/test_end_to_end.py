@@ -1,24 +1,15 @@
 from __future__ import annotations
 
 import json
-import sys
 import zipfile
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent))
-from make_fixture import build  # noqa: E402
-
-from depgraph import get_profile, infer, ingest, to_dot, to_mermaid  # noqa: E402
-from depgraph.cli import main  # noqa: E402
-from depgraph.infer import _topology  # noqa: E402
-from depgraph.model import Edge, Graph, Node  # noqa: E402
-
-
-@pytest.fixture(scope="session")
-def extract(tmp_path_factory) -> Path:
-    return build(tmp_path_factory.mktemp("fx") / "extract.zip")
+from depgraph import get_profile, infer, ingest, to_dot, to_mermaid
+from depgraph.cli import main
+from depgraph.infer import _topology
+from depgraph.model import Edge, Graph, Node
 
 
 def run(source: Path, tmp_path: Path, profile: str = "salesforce") -> dict:

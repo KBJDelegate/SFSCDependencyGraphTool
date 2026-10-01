@@ -10,6 +10,8 @@ graph.dot
 # advance. Ignore JSON at the repo root, where runs land; committed config
 # lives in subdirectories (.devcontainer/, depgraph/) and is unaffected.
 /*.json
+# Per-entity Markdown docs quote real values (ranges, picklist values).
+*-docs/
 
 # ---------------------------------------------------------------------------
 # Salesforce extracts — real customer data, never commit

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import shutil
 import sys
 import tempfile
@@ -10,7 +12,9 @@ import time
 from pathlib import Path
 
 from . import render
-from .ingest import filter_members, ingest as run_ingest, list_sources, read_name_filter
+from .docs import write_docs
+from .ingest import filter_members, ingest as run_ingest, list_sources, plan_parts
+from .ingest import read_name_filter
 from .infer import infer
 from .profiles import PROFILES, get_profile
 
@@ -18,10 +22,18 @@ from .profiles import PROFILES, get_profile
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="depgraph",
-        description="Build an AI-agent-readable dependency graph from a zip "
-        "(or directory) of tabular extracts.",
+        description="Build an AI-agent-readable dependency graph, and a folder of "
+        "Markdown docs per entity, from a zip (or directory) of tabular extracts. "
+        "Zips inside zips are opened, and an object split across several zips is "
+        "merged back into one.",
     )
-    p.add_argument("source", type=Path, help="extract .zip, or a directory of sheets")
+    p.add_argument(
+        "source",
+        type=Path,
+        nargs="+",
+        help="extract .zip (which may hold more zips), a directory of sheets or "
+        "zips, or several zips of one export",
+    )
     p.add_argument(
         "-o",
         "--out",
@@ -38,7 +50,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="also write a Graphviz DOT diagram here (off unless asked for)",
     )
     p.add_argument(
-        "--json-only", action="store_true", help="write only the JSON, no diagrams"
+        "--docs",
+        type=Path,
+        metavar="DIR",
+        help="folder for the Markdown docs, one page per entity "
+        "(default: <JSON name>-docs beside the JSON)",
+    )
+    p.add_argument("--no-docs", action="store_true", help="do not write the docs folder")
+    p.add_argument(
+        "--no-values",
+        action="store_true",
+        help="keep data values out of the docs: no ranges, no picklist values, "
+        "only structure and counts",
+    )
+    p.add_argument(
+        "--json-only",
+        action="store_true",
+        help="write only the JSON: no diagrams, no docs",
     )
     p.add_argument(
         "--include-empty",
@@ -69,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-rows",
         type=int,
-        help="read at most N rows per sheet (faster, approximate stats)",
+        help="read at most N rows per file (faster, approximate stats)",
     )
     p.add_argument(
         "--sample",
@@ -90,7 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="when name and prefix give no candidate, accept a target whose key "
         "covers at least this share of the values; 0 disables (default: 0.8)",
     )
-    p.add_argument("--staging", type=Path, help="staging dir (default: a temp dir)")
+    p.add_argument(
+        "--staging",
+        type=Path,
+        help="staging dir, which also receives unpacked inner zips "
+        "(default: a temp dir)",
+    )
     p.add_argument(
         "--keep-staging", action="store_true", help="keep staged parquet for debugging"
     )
@@ -99,19 +132,34 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def default_stem(sources: list[Path]) -> str:
+    """Output name for the sources: the source's own name, or for several parts of
+    one export ("WE_00D_1.ZIP", "WE_00D_2.ZIP") the name they share ("WE_00D")."""
+    stems = [s.stem or s.name for s in sources]
+    if len(stems) == 1:
+        return stems[0]
+    common = os.path.commonprefix(stems)
+    common = re.sub(r"[\s._-]*\d*[\s._-]*$", "", common)
+    return common or "extract"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if not args.source.exists():
-        print(f"depgraph: {args.source} does not exist", file=sys.stderr)
-        return 2
+    for src in args.source:
+        if not src.exists():
+            print(f"depgraph: {src} does not exist", file=sys.stderr)
+            return 2
 
     # By default the outputs are named after the source, so a bare
-    # `depgraph extract.zip` writes extract.json and extract.mmd. DOT is opt-in.
-    out = args.out or Path(f"{args.source.stem or args.source.name}.json")
+    # `depgraph extract.zip` writes extract.json, extract.mmd and extract-docs/.
+    out = args.out or Path(f"{default_stem(args.source)}.json")
     mermaid = args.mermaid or out.with_suffix(".mmd")
     dot = args.dot
+    docs_dir = args.docs or out.with_name(f"{out.stem}-docs")
     if args.json_only:
-        mermaid = dot = None
+        mermaid = dot = docs_dir = None
+    if args.no_docs:
+        docs_dir = None
 
     profile = get_profile(args.profile)
     log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr))
@@ -123,20 +171,20 @@ def main(argv: list[str] | None = None) -> int:
         log(f"  [{done}/{total}] {member}")
 
     try:
-        log(f"reading {args.source} (profile: {profile.name})")
+        names = ", ".join(str(s) for s in args.source)
+        log(f"reading {names} (profile: {profile.name})")
 
-        members = None
+        discovered = list_sources(args.source, staging / "archives", log)
+        archives = len({m.path for m in discovered if m.name is not None})
+        members = discovered
         unmatched: list[str] = []
         if args.include:
             if not args.include.exists():
                 print(f"depgraph: {args.include} does not exist", file=sys.stderr)
                 return 2
             wanted = read_name_filter(args.include)
-            _, discovered = list_sources(args.source)
             members, unmatched = filter_members(discovered, wanted)
-            log(
-                f"include list: {len(members)} of {len(discovered)} sheets selected"
-            )
+            log(f"include list: {len(members)} of {len(discovered)} files selected")
             if unmatched:
                 log(
                     f"  warning: {len(unmatched)} name(s) matched nothing: "
@@ -146,8 +194,25 @@ def main(argv: list[str] | None = None) -> int:
             if not members:
                 raise SystemExit(
                     f"none of the {len(wanted)} names in {args.include} matched a "
-                    f"sheet in {args.source}"
+                    f"sheet in {names}"
                 )
+        if not members:
+            raise SystemExit(f"no tabular files found in {names}")
+
+        groups, skipped = plan_parts(members)
+        split = {k: v for k, v in groups.items() if len(v) > 1}
+        copies = sum(len(v) for v in skipped.values())
+        log(
+            f"{len(members)} files"
+            + (f" in {archives} zip archives" if archives > 1 else "")
+        )
+        if split:
+            log(
+                f"{len(split)} objects are split across several files; their "
+                f"{sum(len(v) for v in split.values())} parts are merged"
+            )
+        if copies:
+            log(f"skipping {copies} file(s) that are identical copies of another part")
 
         nodes = run_ingest(
             args.source,
@@ -161,10 +226,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         read_s = time.perf_counter() - started
 
-        empty_names = sorted(n.id for n in nodes if n.rows == 0)
-        if not args.include_empty and empty_names:
+        unreadable = [
+            n for n in nodes if n.rows == 0 and any("unreadable" in w for w in n.warnings)
+        ]
+        for n in unreadable:
+            log(f"  warning: could not read {n.source}: {n.warnings[-1]}")
+        bad = {id(n) for n in unreadable}
+        empty_names = sorted(n.id for n in nodes if n.rows == 0 and id(n) not in bad)
+        if not args.include_empty:
             nodes = [n for n in nodes if n.rows > 0]
-            log(f"excluded {len(empty_names)} sheets with no rows")
+            if empty_names:
+                log(f"excluded {len(empty_names)} sheets with no rows")
         if not nodes:
             raise SystemExit("every sheet was empty; nothing to graph")
 
@@ -175,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             min_confidence=args.min_confidence,
             overlap_threshold=args.overlap_threshold,
         )
-        graph.source = str(args.source)
+        graph.source = names
         total_rows = sum(n.rows for n in nodes)
         graph.stats = {
             "sheets": len(nodes),
@@ -183,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
             "columns": sum(len(n.columns) for n in nodes),
             "edges": len(graph.edges),
             "unresolved": len(graph.unresolved),
+            "files": len(members) - copies,
+            "split_objects": sum(1 for n in nodes if len(n.parts) > 1),
             "read_seconds": round(read_s, 2),
             "total_seconds": round(time.perf_counter() - started, 2),
             "sampled": bool(args.max_rows),
@@ -203,6 +277,20 @@ def main(argv: list[str] | None = None) -> int:
         if dot:
             dot.write_text(render.to_dot(graph, args.min_confidence), encoding="utf-8")
             written.append(dot)
+        if docs_dir:
+            pages = write_docs(
+                graph,
+                docs_dir,
+                values=not args.no_values,
+                context={
+                    "files": len(members) - copies,
+                    "bytes": sum(m.size for p in groups.values() for m in p),
+                    "archives": archives,
+                    "copies": copies,
+                    "excluded_empty": 0 if args.include_empty else len(empty_names),
+                    "unreadable": [n.source for n in unreadable],
+                },
+            )
     finally:
         if not args.keep_staging and args.staging is None:
             shutil.rmtree(staging, ignore_errors=True)
@@ -217,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
         log(f"cycles: {', '.join(' <-> '.join(c) for c in graph.cycles)}")
     for path in written:
         log(f"wrote {path} ({path.stat().st_size:,} bytes)")
+    if docs_dir:
+        log(f"wrote {docs_dir}/ ({len(pages)} pages; start at {docs_dir / 'README.md'})")
     return 0
 
 

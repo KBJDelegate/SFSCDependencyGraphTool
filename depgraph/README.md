@@ -1,11 +1,12 @@
 # depgraph
 
 Turn a zip of tabular extracts into a dependency graph an AI agent can read in
-one shot, instead of opening every file to work out how the tables relate.
+one shot, instead of opening every file to work out how the tables relate, plus
+a folder of Markdown docs with one page per entity.
 
-Built for Salesforce extracts (a zip of `.xlsx`, one sheet per object), but the
-Salesforce knowledge lives in a swappable **profile**, so the same engine works
-on any zip or directory of sheets.
+Built for Salesforce extracts (a zip of `.csv` or `.xlsx`, one per object, often
+split over several zips), but the Salesforce knowledge lives in a swappable
+**profile**, so the same engine works on any zip or directory of sheets.
 
 ```bash
 uv run depgraph extract.zip
@@ -16,10 +17,12 @@ uv run depgraph extract.zip
 16 relationships, 3 pointing outside the extract
 wrote big.json (11,599 bytes)
 wrote big.mmd (1,110 bytes)
+wrote big-docs/ (8 pages; start at big-docs/README.md)
 ```
 
 Every output is named after the source, so there is nothing to pass. Use `-o`
-to put the JSON elsewhere (the diagrams follow it) or `--json-only` to skip them.
+to put the JSON elsewhere (the diagrams and docs follow it), `--no-docs` to skip
+the docs, or `--json-only` to write nothing but the JSON.
 
 The output size tracks the **schema**, not the data: that 1.2M-row extract and a
 7,300-row one both produce an ~11 KB graph, small enough to paste into a prompt.
@@ -81,6 +84,99 @@ Key fields:
 The `.mmd` file is a Mermaid ER diagram for humans reviewing what was inferred;
 it renders inline on GitHub and in most markdown viewers. Pass `--dot PATH` if
 you also want Graphviz DOT, where dashed edges are `name-only` guesses.
+
+## Input: zips of zips, and objects split across them
+
+A Salesforce data export of a large org does not come as one zip. Each zip is
+capped at about 512 MB, so the export is several of them (`WE_00D..._1.ZIP`,
+`_2.ZIP`, ...), sometimes delivered inside one outer zip, and **a large object
+is split across them**: `Task.csv` in `_1.ZIP` holds some rows and `Task.csv` in
+`_2.ZIP` holds the rest. All of these shapes are read:
+
+```bash
+depgraph export.zip                    # a zip, which may hold more zips
+depgraph WE_00D_1.ZIP WE_00D_2.ZIP     # several zips of one export
+depgraph downloads/                    # a directory of sheets and/or zips
+```
+
+Zips inside zips are opened up to four levels deep. Each inner zip is copied to
+the staging directory first, since reading a compressed zip in place means
+decompressing it again on every seek. That costs disk space equal to the
+inner zips' size while the run lasts.
+
+**Files with the same name are parts of one object and are merged into one
+entity.** Names match case-insensitively, ignoring folders and extension. The
+parts are still read one at a time, so memory stays bounded by one part. Their
+statistics are then combined exactly, not estimated:
+
+- Rows, empty counts and key-prefix counts add up.
+- Distinct counts come from hashes of the values staged per part, so a value
+  that appears in two parts is counted once.
+- Identifier columns are merged into one staged column before relationships
+  are checked, so `resolve_rate` covers every part.
+
+The test suite checks this by reading the same org whole and split. Every
+statistic of every column comes out identical.
+
+A merged entity lists its files in `parts` in the JSON. Things that can go wrong
+with parts are reported rather than hidden:
+
+| Situation | What happens |
+|---|---|
+| The same file appears in two zips, byte for byte (same CRC-32 and size) | Read once. The copy is named in the entity's `warnings`. |
+| The parts repeat rows, so the key is no longer unique overall | The key is kept (it is unique within each part), with a warning giving the number of repeated values. |
+| A column is missing from some parts | The column is kept. Rows from those parts count as empty, and a warning names the column. |
+| A file cannot be read | Reported on the console and in the docs, never dropped silently. |
+
+The JSON's `source` is the name of the first part. With several sources, each
+`parts` label is prefixed with the zip it came from, e.g.
+`WE_00D_2.ZIP!Task.csv`. Several sources are named after what their names
+share: `WE_00D_1.ZIP WE_00D_2.ZIP` writes `WE_00D.json`.
+
+## Docs: one Markdown page per entity
+
+Alongside the JSON, `depgraph` writes a folder of Markdown meant to be opened
+one entity at a time, by an agent or a person. The JSON stays lean enough to
+paste into a prompt; the docs carry the detail:
+
+```
+extract-docs/
+  README.md             start here: statistics, every entity, load order, cycles, warnings
+  relationships.md      every relationship and every outside reference in one table
+  entities/Account.md   one page per entity
+```
+
+An entity page gives:
+
+- **Facts:** row count, column count (with data / always empty), primary key and
+  its key prefix, source file(s) and size, load-order layer and what to load
+  first, and any cycle the entity is part of.
+- **Points at:** each reference column, its target, cardinality, resolve rate
+  and empty share. Polymorphic columns list every target, including ones
+  outside the extract ("also points at Lead (outside the extract)").
+- **Referenced by:** every column in other entities that points here.
+- **References outside this extract**, with the object each key prefix
+  belongs to, where it is known.
+- **Columns:** type, filled %, distinct count (marked *unique*), and details:
+  number and date ranges, maximum text length, key prefixes of polymorphic
+  columns, and, for columns with at most 20 distinct values, every value with
+  its row count (picklists, flags, statuses).
+- **Always empty:** columns with no value in any row, listed compactly. A full
+  org export has many.
+
+Dates exported as ISO text (`2024-01-31T10:00:00.000Z`, as Salesforce CSVs
+carry them) are typed `date` or `datetime` and given a range, rather than being
+called strings.
+
+**The docs contain data values** (ranges and picklist values), so treat them
+like the extract itself. `--no-values` leaves every value out, keeping
+structure and counts only. The JSON never contains values.
+
+`--docs DIR` writes the folder somewhere else (`--docs docs` for a plain
+`docs/`). Every page starts with a `<!-- generated by depgraph` marker. A rerun
+deletes marked pages it no longer writes, so an entity that has left the
+extract leaves no stale page, and it never touches any other file in the
+folder.
 
 ## Narrowing a full org export
 
@@ -181,11 +277,14 @@ and why references to objects *missing* from the extract can still be named.
 
 ### Memory and scale
 
-Memory is bounded by `workers × one sheet`, not by the extract, because `.xlsx`
-caps a sheet at 1,048,576 rows — a multi-GB extract is always *many* bounded
-sheets, never one huge one. Measured on 1.175M rows / 81 MB of xlsx across 6
-sheets: **3.0s wall, 452 MB peak per worker**. Scale roughly linearly in total
-bytes; use `-j` to trade memory for speed.
+Memory is bounded by `workers × one file`, not by the extract, because `.xlsx`
+caps a sheet at 1,048,576 rows and Salesforce caps each export zip at ~512 MB.
+A multi-GB extract is always *many* bounded files, never one huge one, and an
+object split across zips is still read one part at a time. Measured on 1.175M
+rows / 81 MB of xlsx across 6 sheets: **3.0s wall, 452 MB peak per worker**.
+On a 1M-row Task split three ways across nested zips, peak memory fell from 711
+MB (read whole) to 437 MB, with identical results. Scale roughly linearly in
+total bytes; use `-j` to trade memory for speed.
 
 For a very wide or very long sheet, `--max-rows N` profiles a prefix instead
 (stats become approximate; `stats.sampled` records it).
@@ -232,30 +331,39 @@ It then appears as `--profile my-export`. The hooks worth overriding are
 -o, --out PATH            JSON graph path (default: <source name>.json)
     --mermaid PATH        Mermaid ER diagram path (default: beside the JSON)
     --dot PATH            also write a Graphviz DOT diagram (off by default)
-    --json-only           write only the JSON, no diagrams
+    --docs DIR            Markdown docs folder (default: <JSON name>-docs)
+    --no-docs             do not write the docs folder
+    --no-values           keep data values (ranges, picklist values) out of the docs
+    --json-only           write only the JSON: no diagrams, no docs
     --profile NAME        export dialect (default: salesforce)
 -j, --workers N           parallel readers (default: cpus)
     --max-rows N          read at most N rows per sheet (approximate stats)
     --sample N            rows sampled to classify a column (default: 500)
     --min-confidence F    drop inferred edges below this (default: 0.5)
     --overlap-threshold F accept a value-overlap match at or above this (default: 0.8)
-    --staging DIR         keep staged parquet here instead of a temp dir
+    --staging DIR         staged parquet and unpacked inner zips (default: a temp dir)
     --indent N            JSON indent; 0 for compact
 ```
 
-`source` may be the extract `.zip` or an already-unpacked directory. `.xlsx`,
-`.xlsm`, `.xlsb`, `.csv` and `.tsv` are read.
+`source` is one or more extract `.zip` files (which may hold more zips) or
+directories. `.xlsx`, `.xlsm`, `.xlsb`, `.csv` and `.tsv` are read.
 
 ## Library use
 
 ```python
-from depgraph import ingest, infer, get_profile, to_json
+from depgraph import ingest, infer, get_profile, to_json, write_docs
 
 if __name__ == "__main__":  # required: workers use the "spawn" start method
     nodes = ingest(Path("extract.zip"), Path("staging"), "salesforce")
     graph = infer(nodes, get_profile("salesforce"))
     print(to_json(graph))
+    write_docs(graph, Path("extract-docs"))
 ```
+
+`ingest` also takes a list of paths. To choose files first, call
+`list_sources(paths, scratch_dir)`, which returns a `Member` for every tabular
+file (nested zips are unpacked into `scratch_dir`). Filter that list and pass
+it as `ingest(..., members=...)`.
 
 Workers are started with `spawn` rather than `fork`: polars starts a Rayon
 threadpool on import, and forking a parent holding its locks deadlocks the
@@ -267,11 +375,13 @@ the tool logs a warning and reads sequentially instead of failing.
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest -q          # 17 tests, ~3s
+uv run pytest -q          # 57 tests, ~100s
 ```
 
 Tests run against a synthetic extract (`tests/make_fixture.py`) built to contain
 the awkward cases: self-references, polymorphic columns, references to absent
-objects, ~2% deliberately dangling ids, nullable lookups and a custom object
-with `__c` lookups. The suite asserts the inferred edge set matches the planted
-one exactly — in both profiles.
+objects, ~2% deliberately dangling ids, nullable lookups, ISO text dates and a
+custom object with `__c` lookups. The suite asserts the inferred edge set
+matches the planted one exactly, in both profiles. `build_split` lays the
+same org out as a large data export: two zips inside a zip, with Contact (CSV)
+and Task (xlsx) split between them and an identical copy of User in both.
