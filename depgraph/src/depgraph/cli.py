@@ -13,10 +13,15 @@ from pathlib import Path
 
 from . import render
 from .docs import write_docs
-from .ingest import filter_members, ingest as run_ingest, list_sources, plan_parts
+from .ingest import container, filter_members, ingest as run_ingest, list_sources
+from .ingest import plan_parts
 from .ingest import read_name_filter
 from .infer import infer
 from .profiles import PROFILES, get_profile
+
+
+#: Lists in the console log are cut to this many lines.
+SHOW = 20
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -143,11 +148,63 @@ def default_stem(sources: list[Path]) -> str:
     return common or "extract"
 
 
+def log_plan(log, members, names: str, split: dict, skipped: dict) -> None:
+    """Say what was found where, before the slow part starts."""
+    where: dict[str, list] = {}
+    for m in members:
+        where.setdefault(container(m) or names, []).append(m)
+    log(f"found {len(members)} files" + (":" if len(where) > 1 else ""))
+    if len(where) > 1:
+        for name, found in where.items():
+            mb = sum(m.size for m in found) / 1e6
+            log(f"  {name}: {len(found)} files, {mb:,.1f} MB")
+    if split:
+        log(
+            f"{len(split)} objects are split across several files; their "
+            f"{sum(len(v) for v in split.values())} parts are merged:"
+        )
+        for parts in list(split.values())[:SHOW]:
+            log(
+                f"  {parts[0].basename} in "
+                + ", ".join(container(p) or p.label for p in parts)
+            )
+        if len(split) > SHOW:
+            log(f"  ... and {len(split) - SHOW} more")
+    copies = [label for labels in skipped.values() for label in labels]
+    if copies:
+        log(f"skipping {len(copies)} file(s) that are identical copies of another part:")
+        for label in copies[:SHOW]:
+            log(f"  {label}")
+        if len(copies) > SHOW:
+            log(f"  ... and {len(copies) - SHOW} more")
+
+
+def _unquote(path: Path) -> Path:
+    r"""Undo a Windows quoting trap: "C:\My dir\" reaches the program as
+    `C:\My dir"`, because the C runtime reads the final \" as an escaped quote.
+    Tab-completion in PowerShell adds exactly that trailing backslash."""
+    text = str(path)
+    if text.endswith('"') and not path.exists():
+        fixed = Path(text.rstrip('"').rstrip())
+        if fixed.exists():
+            return fixed
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.source = [_unquote(s) for s in args.source]
+    if args.include:
+        args.include = _unquote(args.include)
     for src in args.source:
         if not src.exists():
             print(f"depgraph: {src} does not exist", file=sys.stderr)
+            if '"' in str(src):
+                print(
+                    "  (on Windows, a quoted path must not end in a backslash: "
+                    'write "C:\\My dir", not "C:\\My dir\\")',
+                    file=sys.stderr,
+                )
             return 2
 
     # By default the outputs are named after the source, so a bare
@@ -202,17 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         groups, skipped = plan_parts(members)
         split = {k: v for k, v in groups.items() if len(v) > 1}
         copies = sum(len(v) for v in skipped.values())
-        log(
-            f"{len(members)} files"
-            + (f" in {archives} zip archives" if archives > 1 else "")
-        )
-        if split:
-            log(
-                f"{len(split)} objects are split across several files; their "
-                f"{sum(len(v) for v in split.values())} parts are merged"
-            )
-        if copies:
-            log(f"skipping {copies} file(s) that are identical copies of another part")
+        log_plan(log, members, names, split, skipped)
 
         nodes = run_ingest(
             args.source,
@@ -223,8 +270,20 @@ def main(argv: list[str] | None = None) -> int:
             sample_n=args.sample,
             progress=progress,
             members=members,
+            keep_empty=args.include_empty,
         )
         read_s = time.perf_counter() - started
+        merged = [n for n in nodes if len(n.parts) > 1]
+        if merged:
+            log(f"merged {len(merged)} split objects:")
+            for n in merged[:SHOW]:
+                log(
+                    f"  {n.id}: {n.rows:,} rows from {len(n.parts)} files ("
+                    + " + ".join(f"{r:,}" for r in n.part_rows)
+                    + ")"
+                )
+            if len(merged) > SHOW:
+                log(f"  ... and {len(merged) - SHOW} more")
 
         unreadable = [
             n for n in nodes if n.rows == 0 and any("unreadable" in w for w in n.warnings)

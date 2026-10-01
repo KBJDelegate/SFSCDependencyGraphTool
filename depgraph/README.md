@@ -99,6 +99,43 @@ depgraph WE_00D_1.ZIP WE_00D_2.ZIP     # several zips of one export
 depgraph downloads/                    # a directory of sheets and/or zips
 ```
 
+On Windows, a quoted path must not end in a backslash: `"C:\My dir\"` reaches
+the program as `C:\My dir"`, because `\"` reads as an escaped quote.
+PowerShell's tab-completion adds that backslash. `depgraph` recognises the stray
+quote and strips it, but other tools won't.
+
+Before reading, the log says what was found in each zip and which objects are
+split across which zips. Then one line is written per file as it finishes, so
+no line ever needs updating. A part says it is a part, and the merged totals
+follow:
+
+```
+found 9 files:
+  WE_1.zip: 5 files, 0.3 MB
+  WE_2.zip: 4 files, 0.3 MB
+2 objects are split across several files; their 4 parts are merged:
+  Contact.csv in WE_1.zip, WE_2.zip
+  Task.xlsx in WE_1.zip, WE_2.zip
+skipping 1 file(s) that are identical copies of another part:
+  WE_2.zip!User.xlsx
+  [1/8] WE_2.zip!Contact.csv: 1,000 rows in 0.0s (one of 2 parts of Contact)
+  [2/8] WE_1.zip!Contact.csv: 1,000 rows in 0.0s (one of 2 parts of Contact)
+  [3/8] WE_2.zip!Opportunity.xlsx: 1,500 rows in 0.0s
+  ...
+merged 2 split objects:
+  Contact: 2,000 rows from 2 files (1,000 + 1,000)
+  Task: 3,000 rows from 2 files (1,500 + 1,500)
+```
+
+An empty file's line says what becomes of it: `empty, excluded`, or `empty part`
+when other parts of the same object may still have rows. A split entity's docs
+page lists every part with its row count, and every figure on the page covers
+all the parts.
+
+Files are read in parallel, one worker process per CPU by default (`-j N` to
+change it; each worker holds one file in memory), and inner zips are unpacked
+on parallel threads.
+
 Zips inside zips are opened up to four levels deep. Each inner zip is copied to
 the staging directory first, since reading a compressed zip in place means
 decompressing it again on every seek. That costs disk space equal to the
@@ -374,8 +411,7 @@ the tool logs a warning and reads sequentially instead of failing.
 ## Development
 
 ```bash
-uv venv && uv pip install -e ".[dev]"
-uv run pytest -q          # 57 tests, ~100s
+uv run --extra dev pytest -q   # 60 tests, ~30-100s
 ```
 
 Tests run against a synthetic extract (`tests/make_fixture.py`) built to contain

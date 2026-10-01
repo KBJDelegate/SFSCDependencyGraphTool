@@ -193,7 +193,19 @@ class _Docs:
         out += [f"- **{k}:** {v}" for k, v in facts]
 
         if len(n.parts) > 1:
-            out += ["", "Parts:", ""] + [f"- {_code(p)}" for p in n.parts]
+            out += [
+                "",
+                "The export split this entity across several files. They are added "
+                "together here: every count on this page covers all of them.",
+                "",
+                "| Part | Rows |",
+                "|---|---|",
+            ]
+            out += [
+                f"| {_code(p)} | {_n(r)} |"
+                for p, r in zip(n.parts, n.part_rows or [0] * len(n.parts))
+            ]
+            out.append(f"| **Total** | **{_n(n.rows)}** |")
 
         if outgoing:
             out += [

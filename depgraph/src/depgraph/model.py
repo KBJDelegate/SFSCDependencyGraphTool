@@ -80,6 +80,8 @@ class Node:
     #: Labels of every file this object was read from; more than one when an
     #: export split it across several zips.
     parts: list[str] = field(default_factory=list)
+    #: Rows read from each of ``parts``, in the same order; they sum to ``rows``.
+    part_rows: list[int] = field(default_factory=list)
     size_bytes: int = 0
 
     def column(self, name: str) -> ColumnStats | None:

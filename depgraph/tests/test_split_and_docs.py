@@ -108,6 +108,17 @@ def test_several_zips_can_be_passed_at_once(tmp_path, monkeypatch):
     assert (folder / "WE-docs" / "README.md").exists()
 
 
+def test_a_stray_quote_from_windows_quoting_is_forgiven(extract, tmp_path):
+    """PowerShell tab-completes "C:\\dir\\", and Windows hands the program
+    `C:\\dir"`: the trailing backslash escapes the closing quote."""
+    folder = tmp_path / "Data prod" / "JF Dataudtræk 11-09-2026"
+    folder.mkdir(parents=True)
+    with zipfile.ZipFile(extract) as zf:
+        zf.extractall(folder)
+    g = run([f'{folder}"'], tmp_path)
+    assert edges(g) == EXPECTED
+
+
 def test_output_name_for_several_sources():
     assert default_stem([Path("extract.zip")]) == "extract"
     assert default_stem([Path("WE_00D_1.ZIP"), Path("WE_00D_2.ZIP")]) == "WE_00D"
@@ -280,4 +291,45 @@ def test_split_docs_report_the_merge(split_extract, tmp_path):
     assert "in 2 zip archives" in readme
     page = (tmp_path / "g-docs" / "entities" / "Contact.md").read_text()
     assert "split across 2 files" in page
-    assert "- `WE_2.zip!Contact.csv`" in page
+    # Each part's own count, and the total every figure on the page is based on.
+    assert "| `WE_1.zip!Contact.csv` | 1,000 |" in page
+    assert "| `WE_2.zip!Contact.csv` | 1,000 |" in page
+    assert "| **Total** | **2,000** |" in page
+    assert "- **Rows:** 2,000" in page
+    readme = (tmp_path / "g-docs" / "README.md").read_text()
+    assert "| [Contact](entities/Contact.md) | 2,000 |" in readme
+
+
+def test_the_log_says_which_file_is_being_read(split_extract, tmp_path, capsys):
+    """With many zips, a long wait must be attributable to one named file."""
+    out = tmp_path / "log.json"
+    assert main([str(split_extract), "-o", str(out), "-j", "2", "--no-docs"]) == 0
+    err = capsys.readouterr().err
+    # Before reading: what is in each zip, and what is split across which.
+    assert "  WE_1.zip: 5 files," in err
+    assert "  WE_2.zip: 4 files," in err
+    assert "  Contact.csv in WE_1.zip, WE_2.zip" in err
+    assert "  WE_2.zip!User.xlsx" in err  # the skipped identical copy
+    # While reading: one line per finished file, naming the zip it came from.
+    for label in ("WE_1.zip!Contact.csv", "WE_2.zip!Contact.csv", "WE_2.zip!Task.xlsx"):
+        assert re.search(rf"\] {re.escape(label)}: [\d,]+ rows in", err)
+    # Nothing announces a file before it is finished.
+    assert "reading WE_" not in err
+    # A part says it is a part, and the merged total follows.
+    assert "WE_1.zip!Contact.csv: 1,000 rows in" in err
+    assert "(one of 2 parts of Contact)" in err
+    assert "  Contact: 2,000 rows from 2 files (1,000 + 1,000)" in err
+    assert "  Task: 3,000 rows from 2 files (1,500 + 1,500)" in err
+
+
+def test_the_log_says_what_becomes_of_an_empty_file(tmp_path, capsys):
+    src = tmp_path / "e.zip"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("User.csv", "Id,Name\n005A00000000001,Ann\n")
+        zf.writestr("Case.csv", "Id,CaseNumber\n")  # header only
+    assert main([str(src), "-o", str(tmp_path / "a.json"), "--no-docs"]) == 0
+    assert "Case.csv: empty, excluded" in capsys.readouterr().err
+    assert main(
+        [str(src), "-o", str(tmp_path / "b.json"), "--no-docs", "--include-empty"]
+    ) == 0
+    assert "Case.csv: empty, kept" in capsys.readouterr().err

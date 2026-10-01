@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -69,6 +70,11 @@ def _dtype_name(dt: pl.DataType) -> str:
     return str(dt).lower()
 
 
+def container(m: Member) -> str:
+    """The zip a member was found in, as named in its label ("" if none)."""
+    return m.label.rsplit("!", 1)[0] if "!" in m.label else ""
+
+
 def _safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", name)
 
@@ -85,41 +91,65 @@ def _hidden(name: str) -> bool:
 # --- finding the files -------------------------------------------------------
 
 
+def _unpack(path: Path, info: zipfile.ZipInfo, scratch: Path) -> tuple[Path, float]:
+    """Copy one inner zip out to ``scratch``; runs on a thread of its own."""
+    started = time.perf_counter()
+    fd, local = tempfile.mkstemp(dir=scratch, suffix=".zip")
+    # Each thread opens the outer zip itself rather than sharing one handle.
+    with zipfile.ZipFile(path) as zf, os.fdopen(fd, "wb") as dst, zf.open(info) as src:
+        shutil.copyfileobj(src, dst, length=1 << 20)
+    return Path(local), time.perf_counter() - started
+
+
 def _walk_zip(
     path: Path, prefix: str, scratch: Path | None, depth: int, log
 ) -> list[Member]:
     """Tabular members of a zip, unpacking any zips inside it to ``scratch``."""
     out: list[Member] = []
+    nested: list[zipfile.ZipInfo] = []
     with zipfile.ZipFile(path) as zf:
         for info in zf.infolist():
             if info.is_dir() or _hidden(info.filename):
                 continue
             low = info.filename.lower()
-            label = prefix + info.filename
             if low.endswith(TABULAR):
                 out.append(
-                    Member(str(path), info.filename, label, info.file_size, info.CRC)
+                    Member(
+                        str(path), info.filename, prefix + info.filename,
+                        info.file_size, info.CRC,
+                    )
                 )
             elif low.endswith(ARCHIVE):
                 if depth >= MAX_NESTING:
-                    log(f"  warning: not opening {label}: zips nested too deep")
+                    log(f"  warning: not opening {prefix}{info.filename}: zips nested too deep")
                     continue
-                if scratch is None:
-                    raise ValueError(
-                        f"{label} is a zip inside a zip; pass a scratch directory "
-                        "to unpack it into"
-                    )
-                # Opened in place, a compressed inner zip would be decompressed
-                # again for every backwards seek. One copy to disk is far cheaper.
-                scratch.mkdir(parents=True, exist_ok=True)
-                fd, local = tempfile.mkstemp(dir=scratch, suffix=".zip")
-                log(f"  unpacking {label} ({info.file_size / 1e6:,.1f} MB)")
-                with os.fdopen(fd, "wb") as dst, zf.open(info) as src:
-                    shutil.copyfileobj(src, dst, length=1 << 20)
-                try:
-                    out += _walk_zip(Path(local), label + "!", scratch, depth + 1, log)
-                except zipfile.BadZipFile:
-                    log(f"  warning: {label} is not a readable zip, skipped")
+                nested.append(info)
+    if not nested:
+        return out
+    if scratch is None:
+        raise ValueError(
+            f"{prefix}{nested[0].filename} is a zip inside a zip; pass a scratch "
+            "directory to unpack it into"
+        )
+
+    # Opened in place, a compressed inner zip would be decompressed again for
+    # every backwards seek, so each is copied to disk once. The copies run on
+    # threads: zlib releases the GIL while it inflates, so several zips unpack
+    # at once, which matters when an export is a dozen zips of 512 MB.
+    scratch.mkdir(parents=True, exist_ok=True)
+    with cf.ThreadPoolExecutor(min(len(nested), os.cpu_count() or 4)) as pool:
+        jobs = [pool.submit(_unpack, path, info, scratch) for info in nested]
+        unpacked = []
+        for info, job in zip(nested, jobs):
+            local, secs = job.result()
+            label = prefix + info.filename
+            log(f"  unpacked {label} ({info.file_size / 1e6:,.1f} MB) in {secs:.1f}s")
+            unpacked.append((label, local))
+    for label, local in unpacked:
+        try:
+            out += _walk_zip(local, label + "!", scratch, depth + 1, log)
+        except zipfile.BadZipFile:
+            log(f"  warning: {label} is not a readable zip, skipped")
     return out
 
 
@@ -366,6 +396,13 @@ def _ingest_member(
         )
 
 
+def _timed_ingest(*args) -> tuple[list[Node], float]:
+    """``_ingest_member`` plus how long it took, for the progress log."""
+    t = time.perf_counter()
+    nodes = _ingest_member(*args)
+    return nodes, time.perf_counter() - t
+
+
 def _ingest_file(
     local: Path,
     member: Member,
@@ -533,6 +570,7 @@ def _merge(parts: list[Node], staging: Path, group_no: int) -> Node:
         sheet=first.sheet,
         rows=sum(p.rows for p in parts),
         parts=[p.source for p in parts],
+        part_rows=[p.rows for p in parts],
         size_bytes=sum(p.size_bytes for p in parts),
     )
     for p in parts:
@@ -600,6 +638,7 @@ def _combine(
     for gi, key in enumerate(sorted(groups)):
         parts = groups[key]
         node = parts[0] if len(parts) == 1 else _merge(parts, staging, gi)
+        node.part_rows = node.part_rows or [node.rows]
         _finish(node, profile, parts)
         copies = {c for p in parts for c in skipped.get(_member_key(p.source), [])}
         for label in sorted(copies):
@@ -617,11 +656,14 @@ def ingest(
     sample_n: int = 500,
     progress=lambda *_: None,
     members: list[Member] | None = None,
+    keep_empty: bool = False,
 ) -> list[Node]:
     """Read every object in ``source`` into a profiled Node.
 
     ``members`` (from ``list_sources``, perhaps filtered) skips the discovery
-    step; nested zips are unpacked into ``staging``.
+    step; nested zips are unpacked into ``staging``. Empty objects are always
+    returned; ``keep_empty`` only says, in the progress log, whether the caller
+    will drop them, so a line about an empty file can say what happens to it.
     """
     staging.mkdir(parents=True, exist_ok=True)
     if members is None:
@@ -631,6 +673,7 @@ def ingest(
 
     groups, skipped = plan_parts(members)
     tasks = [(m, len(parts) > 1) for parts in groups.values() for m in parts]
+    part_count = {_member_key(m): len(parts) for parts in groups.values() for m in parts}
     # Largest first, so the long jobs start early.
     tasks.sort(key=lambda t: -t[0].size)
     profile = get_profile(profile_name)
@@ -640,12 +683,35 @@ def ingest(
         workers = 1
     nodes: list[Node] = []
     args = (str(staging), profile_name, max_rows, sample_n)
+    total = len(tasks)
+
+    def finished(done: int, m: Member, result: list[Node], secs: float) -> None:
+        """One line per file, written once it is finished, saying what it held
+        and, when that is nothing, what becomes of it."""
+        rows = sum(n.rows for n in result)
+        parts = part_count[_member_key(m)]
+        if any(any("unreadable" in w for w in n.warnings) for n in result):
+            outcome = "UNREADABLE, listed in the warnings at the end"
+        elif rows and parts > 1:
+            name = Path(m.basename).stem
+            outcome = f"{rows:,} rows in {secs:.1f}s (one of {parts} parts of {name})"
+        elif rows:
+            outcome = f"{rows:,} rows in {secs:.1f}s"
+        elif parts > 1:
+            # Whether the object survives depends on its other parts.
+            outcome = f"empty part (the object is split across {parts} files)"
+        elif keep_empty:
+            outcome = "empty, kept"
+        else:
+            outcome = "empty, excluded"
+        progress(done, total, f"{m.label}: {outcome}")
 
     def sequential() -> list[Node]:
         out: list[Node] = []
         for i, (m, split) in enumerate(tasks, 1):
-            out += _ingest_member(m, i, split, *args)
-            progress(i, len(tasks), m.label)
+            result, secs = _timed_ingest(m, i, split, *args)
+            finished(i, m, result, secs)
+            out += result
         return out
 
     if workers == 1:
@@ -660,19 +726,20 @@ def ingest(
             max_workers=workers, mp_context=mp.get_context("spawn")
         ) as pool:
             futures = {
-                pool.submit(_ingest_member, m, i, split, *args): m
+                pool.submit(_timed_ingest, m, i, split, *args): m
                 for i, (m, split) in enumerate(tasks, 1)
             }
-            for i, fut in enumerate(cf.as_completed(futures), 1):
-                nodes += fut.result()
-                progress(i, len(tasks), futures[fut].label)
+            for done, fut in enumerate(cf.as_completed(futures), 1):
+                result, secs = fut.result()
+                finished(done, futures[fut], result, secs)
+                nodes += result
     except (RuntimeError, cf.process.BrokenProcessPool) as exc:
         # "spawn" re-imports the caller's main module, so a script that calls
         # ingest() at import time without an `if __name__ == "__main__"` guard
         # cannot start workers. Degrade to sequential rather than failing.
         progress(
             0,
-            len(tasks),
+            total,
             f"parallel read unavailable ({type(exc).__name__}), reading "
             "sequentially; guard your entry point with "
             'if __name__ == "__main__" to restore it',
