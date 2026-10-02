@@ -9,8 +9,11 @@ split over several zips), but the Salesforce knowledge lives in a swappable
 **profile**, so the same engine works on any zip or directory of sheets.
 
 ```bash
-uv run depgraph extract.zip
+depgraph extract.zip
 ```
+
+(Install it as described in the [root README](../README.md#quick-start), or run
+it from source with `dotnet run --project src/DepGraph -c Release -- extract.zip`.)
 
 ```
 6 sheets / 1,175,000 rows / 38 columns in 3.04s
@@ -132,9 +135,9 @@ when other parts of the same object may still have rows. A split entity's docs
 page lists every part with its row count, and every figure on the page covers
 all the parts.
 
-Files are read in parallel, one worker process per CPU by default (`-j N` to
-change it; each worker holds one file in memory), and inner zips are unpacked
-on parallel threads.
+Files are read in parallel, one thread per CPU by default (`-j N` to change
+it; each reader holds what it has learnt about one file), and inner zips are
+unpacked in parallel too.
 
 Zips inside zips are opened up to four levels deep. Each inner zip is copied to
 the staging directory first, since reading a compressed zip in place means
@@ -147,8 +150,8 @@ parts are still read one at a time, so memory stays bounded by one part. Their
 statistics are then combined exactly, not estimated:
 
 - Rows, empty counts and key-prefix counts add up.
-- Distinct counts come from hashes of the values staged per part, so a value
-  that appears in two parts is counted once.
+- Distinct counts come from 64-bit hashes of the values staged per part, so a
+  value that appears in two parts is counted once.
 - Identifier columns are merged into one staged column before relationships
   are checked, so `resolve_rate` covers every part.
 
@@ -293,13 +296,14 @@ Only `kind: "name-only"` is a genuine guess — there, nothing resolved at all.
 Three passes, designed so cost scales with the number of *identifier* columns
 rather than the size of the data.
 
-1. **Ingest** (parallel, one worker per file). Read each sheet once, profile
-   every column, and stage **only the identifier-shaped columns** to parquet as
-   `distinct value -> row count`. A 600k-row id column becomes a few hundred KB.
+1. **Ingest** (parallel, one reader per file). Stream each sheet once, profile
+   every column as its cells go past, and stage **only the identifier-shaped
+   columns** to disk as `distinct value -> row count`, sorted. A 600k-row id
+   column becomes a few MB.
 2. **Infer**. Propose targets from three independent signals — the type token
    inside the value, the column name, and dialect built-ins — then *check* each
-   proposal with an exact semi-join over the staged columns. Every edge carries
-   a measured resolve rate, not a guess.
+   proposal with an exact merge-join of the sorted staged columns. Every edge
+   carries a measured resolve rate, not a guess.
 3. **Render**. JSON, plus optional Mermaid/DOT. Load order by Kahn layering,
    cycles by Tarjan. Cycles are condensed into a single unit before layering,
    because Salesforce has genuine circular references (Account -> User ->
@@ -317,11 +321,20 @@ and why references to objects *missing* from the extract can still be named.
 Memory is bounded by `workers × one file`, not by the extract, because `.xlsx`
 caps a sheet at 1,048,576 rows and Salesforce caps each export zip at ~512 MB.
 A multi-GB extract is always *many* bounded files, never one huge one, and an
-object split across zips is still read one part at a time. Measured on 1.175M
-rows / 81 MB of xlsx across 6 sheets: **3.0s wall, 452 MB peak per worker**.
-On a 1M-row Task split three ways across nested zips, peak memory fell from 711
-MB (read whole) to 437 MB, with identical results. Scale roughly linearly in
-total bytes; use `-j` to trade memory for speed.
+object split across zips is still read one part at a time.
+
+A file is streamed rather than loaded: per column the reader keeps a hash per
+distinct value, a sample of the first 500 values, value counts while there
+are at most 20 distinct values, and, for identifier columns, each distinct
+value with its row count. So memory follows the number of distinct values,
+not the size of the file.
+
+Measured on 1.8M rows (185 MB of CSV across four objects, the largest a 1M-row
+`Task.csv`, plus a 200k-row `.xlsx`) on a 14-core machine: **4.4 s wall, 480
+MB peak for the whole process**, with output identical to the earlier Python
+version. Each file is read on one thread, so the largest file sets the floor:
+that 1M-row CSV takes 4 s on its own. Workbooks read about three times slower
+than CSV. Use `-j` to trade memory for speed.
 
 For a very wide or very long sheet, `--max-rows N` profiles a prefix instead
 (stats become approximate; `stats.sampled` records it).
@@ -338,27 +351,32 @@ key-prefix signal is absent. It misses only the polymorphic columns, whose mixed
 values fall below the overlap threshold — correct conservatism for a dialect
 with no notion of polymorphism.
 
-Add a dialect by subclassing `Profile` and registering it:
+Add a dialect by subclassing `Profile` in
+[`src/DepGraph/Profiles.cs`](src/DepGraph/Profiles.cs):
 
-```python
-from depgraph.profiles import Profile, register
+```csharp
+public sealed class MyExportProfile : Profile
+{
+    public override string Name => "my-export";
 
-@register
-class MyExportProfile(Profile):
-    name = "my-export"
+    // Lower = better primary-key candidate; 99 = not a candidate.
+    public override int KeyRank(string column, string node) => column == "row_guid" ? 0 : 99;
 
-    def id_token(self, value: str) -> str | None:
-        """Type token embedded in the value, or None if the dialect has none."""
-        return value.split("-")[0] if "-" in value else None
+    public override string? ReferenceBase(string column) =>
+        column.EndsWith("_ref") ? column[..^4] : null;
+}
+```
 
-    def key_rank(self, column: str, node: str) -> int:
-        """Lower = better primary-key candidate; 99 = not a candidate."""
-        return 0 if column == "row_guid" else 99
+and adding it to `Profiles.Registry`:
+
+```csharp
+["my-export"] = () => new MyExportProfile(),
 ```
 
 It then appears as `--profile my-export`. The hooks worth overriding are
-`id_token`, `looks_like_id`, `key_rank`, `reference_base`, `name_aliases`,
-`builtin_targets` and `is_polymorphic`; see `profiles.py`.
+`IdToken` (with `EncodesTypeInValue`), `LooksLikeId`, `KeyRank`,
+`ReferenceBase`, `NameAliases`, `BuiltinTargets`, `IsPolymorphic` and
+`NameForToken`.
 
 ## Options
 
@@ -378,8 +396,10 @@ It then appears as `--profile my-export`. The hooks worth overriding are
     --sample N            rows sampled to classify a column (default: 500)
     --min-confidence F    drop inferred edges below this (default: 0.5)
     --overlap-threshold F accept a value-overlap match at or above this (default: 0.8)
-    --staging DIR         staged parquet and unpacked inner zips (default: a temp dir)
+    --staging DIR         staged columns and unpacked inner zips (default: a temp dir)
+    --keep-staging        keep the staging dir afterwards, for debugging
     --indent N            JSON indent; 0 for compact
+-q, --quiet               print nothing but errors
 ```
 
 `source` is one or more extract `.zip` files (which may hold more zips) or
@@ -387,37 +407,38 @@ directories. `.xlsx`, `.xlsm`, `.xlsb`, `.csv` and `.tsv` are read.
 
 ## Library use
 
-```python
-from depgraph import ingest, infer, get_profile, to_json, write_docs
+The passes are public, so another .NET program can reference the project and
+run them itself:
 
-if __name__ == "__main__":  # required: workers use the "spawn" start method
-    nodes = ingest(Path("extract.zip"), Path("staging"), "salesforce")
-    graph = infer(nodes, get_profile("salesforce"))
-    print(to_json(graph))
-    write_docs(graph, Path("extract-docs"))
+```csharp
+using DepGraph;
+
+var nodes = Ingest.Run(["extract.zip"], "staging", "salesforce");
+var graph = Infer.Run(nodes, Profiles.Get("salesforce"));
+File.WriteAllText("extract.json", Render.ToJson(graph));
+Docs.Write(graph, "extract-docs");
 ```
 
-`ingest` also takes a list of paths. To choose files first, call
-`list_sources(paths, scratch_dir)`, which returns a `Member` for every tabular
-file (nested zips are unpacked into `scratch_dir`). Filter that list and pass
-it as `ingest(..., members=...)`.
-
-Workers are started with `spawn` rather than `fork`: polars starts a Rayon
-threadpool on import, and forking a parent holding its locks deadlocks the
-children. `spawn` re-imports the caller's main module, so an entry point that
-calls `ingest()` at import time needs the `__main__` guard above — without it
-the tool logs a warning and reads sequentially instead of failing.
+`Ingest.Run` takes several paths. To choose files first, call
+`Sources.List(paths, scratchDir)`, which returns a `Member` for every tabular
+file (nested zips are unpacked into `scratchDir`). Filter that list and pass it
+as `new IngestOptions { Members = ... }`.
 
 ## Development
 
 ```bash
-uv run --extra dev pytest -q   # 60 tests, ~30-100s
+dotnet test DepGraph.slnx   # 72 tests, a few seconds
 ```
 
-Tests run against a synthetic extract (`tests/make_fixture.py`) built to contain
-the awkward cases: self-references, polymorphic columns, references to absent
-objects, ~2% deliberately dangling ids, nullable lookups, ISO text dates and a
-custom object with `__c` lookups. The suite asserts the inferred edge set
-matches the planted one exactly, in both profiles. `build_split` lays the
-same org out as a large data export: two zips inside a zip, with Contact (CSV)
-and Task (xlsx) split between them and an identical copy of User in both.
+The layout is `src/DepGraph` (the tool) and `tests/DepGraph.Tests` (xUnit).
+Tests run against a synthetic extract (`tests/DepGraph.Tests/Fixture.cs`) built
+to contain the awkward cases: self-references, polymorphic columns, references
+to absent objects, ~2% deliberately dangling ids, nullable lookups, ISO text
+dates and a custom object with `__c` lookups. The suite asserts the inferred
+edge set matches the planted one exactly, in both profiles. `BuildSplit` lays
+the same org out as a large data export: two zips inside a zip, with Contact
+(CSV) and Task (xlsx) split between them and an identical copy of User in both.
+
+Reading uses [Sep](https://github.com/nietras/Sep) for CSV and
+[ExcelDataReader](https://github.com/ExcelDataReader/ExcelDataReader) for
+`.xlsx`, `.xlsm` and `.xlsb`; the command line is System.CommandLine.

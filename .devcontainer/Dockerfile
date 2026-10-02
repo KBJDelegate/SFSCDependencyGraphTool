@@ -7,6 +7,7 @@
 #   - Added: UV installer + PATH for Python toolchain management (interpreter versions,
 #     project dependencies, and virtual environments)
 #   - Added: chezmoi installer (dotfiles manager, installed to ~/.local/bin)
+#   - Added: .NET SDK (installed to ~/.dotnet) for building and testing depgraph
 #   - Note: user plugins (e.g. superpowers) are NOT baked in — they are installed via VS Code
 #     dotfiles (chezmoi apply) which runs before the firewall (waitFor: postCreateCommand)
 
@@ -109,6 +110,14 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} @anthropic-a
 ARG UV_VERSION=0.10.8
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 ENV PATH="/home/node/.local/bin:$PATH"
+
+# Install the .NET SDK — builds and tests depgraph (depgraph/DepGraph.slnx)
+ARG DOTNET_CHANNEL=10.0
+RUN curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel ${DOTNET_CHANNEL} --install-dir /home/node/.dotnet
+ENV DOTNET_ROOT=/home/node/.dotnet
+ENV PATH="/home/node/.dotnet:$PATH"
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
+ENV DOTNET_NOLOGO=1
 
 # Install chezmoi — dotfiles manager, available on PATH for VS Code dotfiles hook
 RUN sh -c "$(curl -fsLS get.chezmoi.io)" -- -b /home/node/.local/bin

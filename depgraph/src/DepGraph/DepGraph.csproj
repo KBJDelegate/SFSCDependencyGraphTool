@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>DepGraph</RootNamespace>
+    <AssemblyName>depgraph</AssemblyName>
+    <Version>0.3.0</Version>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <Description>Build an AI-agent-readable dependency graph, and Markdown docs per entity, from a zip of tabular extracts (Salesforce .csv/.xlsx and friends).</Description>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>depgraph</ToolCommandName>
+    <PackageId>DepGraph</PackageId>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)../../nupkg</PackageOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ExcelDataReader" Version="3.9.0" />
+    <PackageReference Include="Sep" Version="0.17.1" />
+    <PackageReference Include="System.CommandLine" Version="2.0.12" />
+    <PackageReference Include="System.IO.Hashing" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DepGraph.Tests" />
+  </ItemGroup>
+
+</Project>
