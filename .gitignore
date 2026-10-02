@@ -31,28 +31,23 @@ CLAUDE.md
 claude.md
 
 # ---------------------------------------------------------------------------
-# Python
+# .NET build output
 # ---------------------------------------------------------------------------
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
+bin/
+obj/
+artifacts/
+nupkg/
+TestResults/
+.vs/
+*.user
+
+# ---------------------------------------------------------------------------
+# Leftovers of the earlier Python version in existing checkouts
+# ---------------------------------------------------------------------------
 .venv/
-venv/
-env/
-.python-version
+__pycache__/
 .pytest_cache/
 .ruff_cache/
-.mypy_cache/
-*.egg-info/
-.eggs/
-build/
-dist/
-.coverage
-.coverage.*
-htmlcov/
-.ipynb_checkpoints/
-.tox/
 
 # ---------------------------------------------------------------------------
 # Editors / OS

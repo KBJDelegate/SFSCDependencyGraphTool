@@ -11,15 +11,26 @@ inside each id, the column name, and an actual join of the values), and records
 which of them fired for every relationship it reports.
 
 Measured on a real 865-sheet org export: **~2 GB of CSV reduced to a 500 KB
-graph in under a minute**, covering 135 populated objects, 2,941 columns and
-457 relationships, every one of them verified against the data.
+graph**, covering 135 populated objects, 2,941 columns and 457 relationships,
+every one of them verified against the data. (That run took under a minute with
+the earlier Python version; the .NET tool has not been timed on it yet.)
 
 ## Quick start
 
-```bash
-uv tool install ./depgraph
-depgraph path/to/extract.ZIP
+Needs the [.NET 10 SDK](https://dotnet.microsoft.com/download). Build the tool
+once and install it on your PATH:
+
+```powershell
+dotnet pack depgraph/src/DepGraph -c Release
+dotnet tool install --global DepGraph --add-source depgraph/nupkg
+depgraph path\to\extract.ZIP
 ```
+
+After pulling changes, run the `dotnet pack` line again, then
+`dotnet tool uninstall --global DepGraph` and the install line again
+(`dotnet tool update` skips a rebuild that kept its version number). To run
+straight from the source instead:
+`dotnet run --project depgraph/src/DepGraph -c Release -- path\to\extract.ZIP`.
 
 That writes:
 
@@ -72,7 +83,7 @@ contain, how the three passes work, memory and scale, the options, and how to
 add a profile for a non-Salesforce export dialect.
 
 The Salesforce-specific knowledge lives entirely in
-[`depgraph/src/depgraph/profiles.py`](depgraph/src/depgraph/profiles.py); the
+[`depgraph/src/DepGraph/Profiles.cs`](depgraph/src/DepGraph/Profiles.cs); the
 engine itself is generic, and `--profile generic` runs on any zip of sheets.
 
 ## Notes
