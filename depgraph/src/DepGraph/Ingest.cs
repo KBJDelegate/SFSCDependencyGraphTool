@@ -43,12 +43,6 @@ public sealed record IngestOptions
 
 public static class Ingest
 {
-    /// <summary>
-    /// A column with at most this many distinct values has every value counted,
-    /// so the docs can list picklist values.
-    /// </summary>
-    public const int TopValues = 20;
-
     /// <summary>Read every object in <paramref name="sources"/> into a profiled Node.</summary>
     public static List<Node> Run(IReadOnlyList<string> sources, string staging, string profileName, IngestOptions? options = null)
     {

@@ -38,18 +38,8 @@ public sealed class ColumnStats
 
     public bool IsIdLike { get; set; }
 
-    /// <summary>Smallest and largest value, for numbers and dates: a long, double, DateTime or string.</summary>
-    public object? Min { get; set; }
-    public object? Max { get; set; }
-
     /// <summary>Longest value in characters, for text.</summary>
     public int? MaxLength { get; set; }
-
-    /// <summary>
-    /// Every value with its row count, most common first, kept only while the
-    /// column has few distinct values (picklists, flags). Null means "too many to list".
-    /// </summary>
-    public List<KeyValuePair<string, long>>? TopValues { get; set; }
 
     public long NonNull => Rows - Nulls;
     public bool Unique => NonNull > 0 && Distinct == NonNull;

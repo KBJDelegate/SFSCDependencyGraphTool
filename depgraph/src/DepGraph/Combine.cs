@@ -5,7 +5,6 @@
 // parts counts once; identifier columns are merged into one staged column so
 // pass 2 resolves references against every part.
 
-using System.Globalization;
 
 namespace DepGraph;
 
@@ -98,18 +97,9 @@ internal static class Combine
             // A part without this column contributes its rows as empty.
             Nulls = rows - nonNull,
             IsIdLike = idLike,
-            Min = Extreme(filled.Select(c => c.Min), -1),
-            Max = Extreme(filled.Select(c => c.Max), +1),
             MaxLength = filled.Where(c => c.MaxLength > 0).Select(c => c.MaxLength).Max(),
             IdTokens = ColumnProfiler.MostCommon(Sum(filled.Select(c => c.IdTokens))).Take(12).ToList(),
         };
-
-        if (filled.Count > 0 && filled.All(c => c.TopValues is not null))
-        {
-            var values = Sum(filled.Select(c => c.TopValues!));
-            if (values.Count <= Ingest.TopValues)
-                stats.TopValues = ColumnProfiler.MostCommon(values).ToList();
-        }
 
         var hashes = present.Where(p => p.Part.Hashed.ContainsKey(name)).Select(p => p.Part.Hashed[name]).ToList();
         if (hashes.Count > 0)
@@ -150,36 +140,6 @@ internal static class Combine
             return "datetime";
         return "string";
     }
-
-    /// <summary>The smallest (sign -1) or largest (sign +1) value present.</summary>
-    static object? Extreme(IEnumerable<object?> values, int sign)
-    {
-        object? best = null;
-        foreach (var v in values)
-        {
-            if (v is not null && (best is null || Math.Sign(CompareValues(v, best)) == sign))
-                best = v;
-        }
-        return best;
-    }
-
-    /// <summary>
-    /// Values of one type compare naturally. A date read as text in one part and
-    /// as a date in another falls back to comparing their text.
-    /// </summary>
-    static int CompareValues(object a, object b) => (a, b) switch
-    {
-        (long x, long y) => x.CompareTo(y),
-        (long or double, long or double) => Convert.ToDouble(a, CultureInfo.InvariantCulture)
-            .CompareTo(Convert.ToDouble(b, CultureInfo.InvariantCulture)),
-        (DateTime x, DateTime y) => x.CompareTo(y),
-        _ => string.CompareOrdinal(Text(a), Text(b)),
-    };
-
-    /// <summary>A value as the text it would have been read as, so a date compares like ISO date text.</summary>
-    static string Text(object v) => v is DateTime t
-        ? t.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
-        : Convert.ToString(v, CultureInfo.InvariantCulture) ?? "";
 
     static string? PickKey(string nodeId, List<ColumnStats> columns, Profile profile)
     {

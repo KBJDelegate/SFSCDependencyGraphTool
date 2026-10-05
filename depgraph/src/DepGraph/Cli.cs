@@ -41,10 +41,6 @@ public static partial class Cli
             HelpName = "DIR",
         };
         public readonly Option<bool> NoDocs = new("--no-docs") { Description = "do not write the docs folder" };
-        public readonly Option<bool> NoValues = new("--no-values")
-        {
-            Description = "keep data values out of the docs: no ranges, no picklist values, only structure and counts",
-        };
         public readonly Option<bool> JsonOnly = new("--json-only") { Description = "write only the JSON: no diagrams, no docs" };
         public readonly Option<bool> IncludeEmpty = new("--include-empty")
         {
@@ -116,7 +112,7 @@ public static partial class Cli
                 + "(or directory) of tabular extracts. Zips inside zips are opened, and an object split across "
                 + "several zips is merged back into one.")
             {
-                Source, Out, Mermaid, Dot, Docs, NoDocs, NoValues, JsonOnly, IncludeEmpty, SkipEmpty, Include,
+                Source, Out, Mermaid, Dot, Docs, NoDocs, JsonOnly, IncludeEmpty, SkipEmpty, Include,
                 Profile, Workers, MaxRows, Sample, MinConfidence, OverlapThreshold, Staging, KeepStaging, Indent,
                 Quiet,
             };
@@ -311,7 +307,7 @@ public static partial class Cli
             }
             if (docsDir is not null)
             {
-                pages = Docs.Write(graph, docsDir, values: !p.GetValue(o.NoValues), new DocsContext
+                pages = Docs.Write(graph, docsDir, new DocsContext
                 {
                     Files = members.Count - copies,
                     Bytes = groups.Values.SelectMany(parts => parts).Sum(m => m.Size),
