@@ -1,5 +1,6 @@
 // Exports split across nested zips, and the per-entity Markdown docs.
 
+using System.Globalization;
 using System.IO.Compression;
 using System.Text.RegularExpressions;
 using static DepGraph.Tests.Helpers;
@@ -34,8 +35,6 @@ public sealed class SplitTests : IDisposable
                 Assert.True(ca.Distinct == cb.Distinct, where);
                 Assert.True(ca.IdTokens.SequenceEqual(cb.IdTokens), where);
                 Assert.True(ca.IsIdLike == cb.IsIdLike, where);
-                Assert.True((ca.TopValues ?? []).SequenceEqual(cb.TopValues ?? []) && (ca.TopValues is null) == (cb.TopValues is null), where);
-                Assert.True(Equals(ca.Min, cb.Min) && Equals(ca.Max, cb.Max), where);
                 Assert.True(ca.MaxLength == cb.MaxLength, where);
             }
         }
@@ -213,10 +212,9 @@ public sealed class ProfilerTests
     {
         Assert.Equal("int", Column(p => { p.AddText("1", true); p.AddText("-20", true); }).Type);
         var f = Column(p => { p.AddText("1", true); p.AddText("2.5", true); p.AddText("", true); });
-        Assert.Equal(("float", 1L, 1.0, 2.5), (f.Type, f.Nulls, f.Min, f.Max));
+        Assert.Equal(("float", 1L, 2L), (f.Type, f.Nulls, f.Distinct));
         var b = Column(p => { p.AddText("true", true); p.AddText("FALSE", true); p.AddText("True", true); });
-        Assert.Equal("bool", b.Type);
-        Assert.Equal([KeyValuePair.Create("True", 2L), KeyValuePair.Create("False", 1L)], b.TopValues);
+        Assert.Equal(("bool", 2L), (b.Type, b.Distinct));
         Assert.Equal("string", Column(p => { p.AddText("1", true); p.AddText("true", true); }).Type);
         Assert.Equal("string", Column(p => { p.AddText("12", true); p.AddText("Call", true); }).Type);
         // Text in a workbook stays text, even when it reads as a number.
@@ -228,23 +226,10 @@ public sealed class ProfilerTests
     {
         var day = new DateTime(2024, 1, 31);
         var d = Column(p => { p.AddValue(day); p.AddValue(day.AddHours(5)); p.AddValue(null); });
-        Assert.Equal(("datetime", day, day.AddHours(5), 2L), (d.Type, d.Min, d.Max, d.Distinct));
-        var n = Column(p => { p.AddValue(3.0); p.AddValue(4.0); });
-        Assert.Equal(("int", 3L, 4L), (n.Type, n.Min, n.Max));
+        Assert.Equal(("datetime", 2L), (d.Type, d.Distinct));
+        Assert.Equal("int", Column(p => { p.AddValue(3.0); p.AddValue(4.0); }).Type);
         Assert.Equal("float", Column(p => { p.AddValue(3.0); p.AddValue(4.5); }).Type);
         Assert.Equal("empty", Column(p => p.AddValue(null)).Type);
-    }
-
-    [Fact]
-    public void ManyDistinctValuesAreNotListed()
-    {
-        var c = Column(p =>
-        {
-            for (var i = 0; i < Ingest.TopValues + 1; i++)
-                p.AddText($"v{i}", true);
-        });
-        Assert.Equal(Ingest.TopValues + 1, c.Distinct);
-        Assert.Null(c.TopValues);
     }
 
     [Fact]
@@ -332,19 +317,17 @@ public sealed class DocsTests : IDisposable
         // In: who points here.
         Assert.Contains("| [Task](Task.md) | `WhoId` |", page);
         Assert.Contains("| [Custom_Project__c](Custom_Project__c.md) | `Primary_Contact__c` |", page);
-        // ISO text dates are recognised and given a range.
-        Assert.Matches(@"\| `CreatedDate` \| datetime \| 100% \| [\d,]+ (\(unique\) )?\| 20\d\d-", page);
+        // ISO text dates are recognised as dates.
+        Assert.Matches(@"\| `CreatedDate` \| datetime \| 100% \| [\d,]+ (\(unique\) )?\|  \|", page);
     }
 
     [Fact]
-    public void PicklistValuesAreCounted()
+    public void PicklistsAreCountedNotListed()
     {
         var row = Page("entities", "Opportunity.md").Split('\n').First(l => l.StartsWith("| `StageName`"));
+        Assert.StartsWith("| `StageName` | string | 100% | 3 |", row);
         foreach (var value in new[] { "Prospecting", "Closed Won", "Closed Lost" })
-            Assert.Contains($"`{value}`", row);
-        var counts = Regex.Matches(row, @"` ([\d,]+)").Select(m => int.Parse(m.Groups[1].Value.Replace(",", ""))).ToList();
-        Assert.Equal(1500, counts.Sum());
-        Assert.Equal(counts.OrderDescending(), counts); // most common first
+            Assert.DoesNotContain(value, row);
     }
 
     [Fact]
@@ -356,14 +339,36 @@ public sealed class DocsTests : IDisposable
     }
 
     [Fact]
-    public void NoValuesKeepsDataOutOfTheDocs()
+    public void NoDataValueReachesAnyOutput()
     {
-        Assert.Equal(0, Depgraph(Fixture.Extract, "-o", tmp.File("nv.json"), "--no-values", "-q").Code);
-        var text = string.Concat(Pages(Path.Combine(tmp.Dir, "nv-docs")).Select(File.ReadAllText));
-        foreach (var leaked in new[] { "Closed Won", "Customer", "2019-", "2020-" })
-            Assert.DoesNotContain(leaked, text);
-        // Structure and counts are still there.
-        Assert.Contains("| `StageName` | string | 100% | 3 |", text);
+        var json = tmp.File("nd.json");
+        var (code, log) = Depgraph(Fixture.Extract, "-o", json, "--dot", tmp.File("nd.dot"));
+        Assert.Equal(0, code);
+        var output = string.Concat(
+            new[] { log }.Concat(Directory.EnumerateFiles(tmp.Dir, "*", SearchOption.AllDirectories).Select(File.ReadAllText)));
+
+        // Every value in the extract, except ones that are also a name in the
+        // schema (Task.Subject holds "Email", which is also a column).
+        var sheets = Fixture.Sheets();
+        var names = sheets.Keys.Concat(sheets.Values.SelectMany(t => t.Headers)).ToHashSet(StringComparer.Ordinal);
+        var values = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var cell in sheets.Values.SelectMany(t => t.Rows).SelectMany(r => r))
+        {
+            switch (cell)
+            {
+                case string s when !names.Contains(s):
+                    values.Add(s);
+                    break;
+                case double d when d != Math.Floor(d):
+                    values.Add(d.ToString("R", CultureInfo.InvariantCulture));
+                    values.Add(d.ToString("N2", CultureInfo.InvariantCulture));
+                    break;
+            }
+        }
+        Assert.NotEmpty(values);
+        Assert.All(values, v => Assert.DoesNotContain(v, output, StringComparison.Ordinal));
+        // Nor any date from the data, in whatever format it might be written.
+        Assert.DoesNotMatch(@"\b20(19|2[0-4])-\d\d-\d\d", output);
     }
 
     [Fact]
@@ -442,7 +447,6 @@ public sealed class EdgeCaseTests : IDisposable
         var t = Ingest.Run([src], tmp.Sub("stg"), "generic", new() { Workers = 1 }).Single();
         var flag = t.Column("Flag")!;
         Assert.Equal(("bool", 2L), (flag.Type, flag.Distinct));
-        Assert.Equal([KeyValuePair.Create("True", 2L), KeyValuePair.Create("False", 1L)], flag.TopValues);
         Assert.Equal(("int", 2L), (t.Column("N")!.Type, t.Column("N")!.Distinct));
     }
 
