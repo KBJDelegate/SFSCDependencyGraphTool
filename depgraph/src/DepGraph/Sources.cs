@@ -46,11 +46,14 @@ public static partial class Sources
     /// <summary>
     /// Every tabular file in the given zips and directories, nested zips included.
     /// <paramref name="scratch"/> receives the unpacked copies of zips found inside
-    /// zips; it is only touched when there are any.
+    /// zips; it is only touched when there are any. Nothing under a folder named in
+    /// <paramref name="skipFolders"/> is listed (see <see cref="Profile.SkippedFolders"/>).
     /// </summary>
-    public static List<Member> List(IReadOnlyList<string> sources, string? scratch, Action<string>? log = null)
+    public static List<Member> List(IReadOnlyList<string> sources, string? scratch, Action<string>? log = null,
+        IReadOnlySet<string>? skipFolders = null)
     {
         log ??= _ => { };
+        skipFolders ??= new HashSet<string>();
         // With several sources, prefix labels so Account.csv from each stays apart.
         var several = sources.Count > 1;
 
@@ -66,10 +69,16 @@ public static partial class Sources
                 var files = Directory.EnumerateFiles(src, "*", walk)
                     .Select(f => (Full: f, Rel: Path.GetRelativePath(src, f).Replace('\\', '/')))
                     .OrderBy(f => f.Rel, StringComparer.Ordinal);
+                var skipped = new SortedDictionary<string, int>(StringComparer.Ordinal);
                 foreach (var (full, rel) in files)
                 {
                     if (Hidden(rel))
                         continue;
+                    if (SkippedFolder(rel, skipFolders) is { } folder)
+                    {
+                        skipped[folder] = skipped.GetValueOrDefault(folder) + 1;
+                        continue;
+                    }
                     if (IsTabular(rel))
                     {
                         output.Add(new Member(full, null, dprefix + rel, new FileInfo(full).Length));
@@ -78,7 +87,7 @@ public static partial class Sources
                     {
                         try
                         {
-                            output.AddRange(WalkZip(full, $"{dprefix}{rel}!", scratch, 1, log));
+                            output.AddRange(WalkZip(full, $"{dprefix}{rel}!", scratch, 1, skipFolders, log));
                         }
                         catch (InvalidDataException)
                         {
@@ -86,6 +95,7 @@ public static partial class Sources
                         }
                     }
                 }
+                LogSkipped(skipped, dprefix, log);
             }
             else if (IsTabular(name)) // before the zip check: an xlsx is a zip too
             {
@@ -95,7 +105,7 @@ public static partial class Sources
             {
                 try
                 {
-                    output.AddRange(WalkZip(src, prefix, scratch, 0, log));
+                    output.AddRange(WalkZip(src, prefix, scratch, 0, skipFolders, log));
                 }
                 catch (InvalidDataException exc)
                 {
@@ -115,16 +125,46 @@ public static partial class Sources
         return f.Read(magic) == 4 && magic.SequenceEqual("PK\x03\x04"u8);
     }
 
+    /// <summary>
+    /// The folder <paramref name="name"/> lies in, up to and including the first
+    /// part named in <paramref name="skip"/>; null when it is not under one.
+    /// </summary>
+    static string? SkippedFolder(string name, IReadOnlySet<string> skip)
+    {
+        if (skip.Count == 0)
+            return null;
+        var parts = name.Replace('\\', '/').Split('/');
+        for (var i = 0; i < parts.Length - 1; i++)
+        {
+            if (skip.Contains(parts[i]))
+                return string.Join('/', parts[..(i + 1)]);
+        }
+        return null;
+    }
+
+    static void LogSkipped(SortedDictionary<string, int> skipped, string prefix, Action<string> log)
+    {
+        foreach (var (folder, count) in skipped)
+            log($"  skipped {count:N0} file{(count == 1 ? "" : "s")} under {prefix}{folder}/ (attachments, not data)");
+    }
+
     /// <summary>Tabular members of a zip, unpacking any zips inside it to <paramref name="scratch"/>.</summary>
-    static List<Member> WalkZip(string path, string prefix, string? scratch, int depth, Action<string> log)
+    static List<Member> WalkZip(string path, string prefix, string? scratch, int depth, IReadOnlySet<string> skipFolders,
+        Action<string> log)
     {
         var output = new List<Member>();
         var nested = new List<ZipArchiveEntry>();
+        var skipped = new SortedDictionary<string, int>(StringComparer.Ordinal);
         using var zip = ZipFile.OpenRead(path);
         foreach (var entry in zip.Entries)
         {
             if (entry.FullName.EndsWith('/') || Hidden(entry.FullName))
                 continue;
+            if (SkippedFolder(entry.FullName, skipFolders) is { } folder)
+            {
+                skipped[folder] = skipped.GetValueOrDefault(folder) + 1;
+                continue;
+            }
             if (IsTabular(entry.FullName))
             {
                 output.Add(new Member(path, entry.FullName, prefix + entry.FullName, entry.Length, entry.Crc32));
@@ -139,6 +179,7 @@ public static partial class Sources
                 nested.Add(entry);
             }
         }
+        LogSkipped(skipped, prefix, log);
         if (nested.Count == 0)
             return output;
         if (scratch is null)
@@ -167,7 +208,7 @@ public static partial class Sources
                 continue;
             try
             {
-                output.AddRange(WalkZip(local, label + "!", scratch, depth + 1, log));
+                output.AddRange(WalkZip(local, label + "!", scratch, depth + 1, skipFolders, log));
             }
             catch (InvalidDataException)
             {

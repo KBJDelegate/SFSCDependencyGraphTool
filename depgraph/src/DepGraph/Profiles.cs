@@ -33,6 +33,15 @@ public abstract partial class Profile
 {
     public abstract string Name { get; }
 
+    // --- files ------------------------------------------------------------
+
+    /// <summary>
+    /// Folders that hold files rather than data (attachments and the like).
+    /// Nothing under a folder of one of these names is read, at any depth and in
+    /// any zip; the other files beside it still are.
+    /// </summary>
+    public virtual IReadOnlySet<string> SkippedFolders { get; } = new HashSet<string>();
+
     // --- naming -----------------------------------------------------------
 
     /// <summary>Human-stable node id for one sheet of one file in the zip.</summary>
@@ -170,6 +179,15 @@ public sealed partial class SalesforceProfile : Profile
         "whatid", "whoid", "parentid", "ownerid", "relatedtoid",
         "targetobjectid", "linkedentityid", "subjectid",
     };
+
+    /// <summary>
+    /// An export that includes files puts every uploaded file under
+    /// ContentVersion/, named by its Id. They are the attachments themselves, not
+    /// rows of any object (ContentVersion.csv, beside the folder, holds those),
+    /// and a spreadsheet among them would otherwise be read as an object.
+    /// </summary>
+    public override IReadOnlySet<string> SkippedFolders { get; } =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "ContentVersion" };
 
     public override bool EncodesTypeInValue => true;
 
