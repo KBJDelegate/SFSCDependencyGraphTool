@@ -144,6 +144,22 @@ the staging directory first, since reading a compressed zip in place means
 decompressing it again on every seek. That costs disk space equal to the
 inner zips' size while the run lasts.
 
+**Attachments under `ContentVersion/` are skipped.** An export that includes
+files puts every uploaded file in a `ContentVersion/` folder, named by its Id.
+Those are the attachments themselves, not rows of any object, and a
+spreadsheet or zip among them would otherwise be read as an object or
+unpacked. Nothing under a folder of that name is read, at any depth, in any
+zip or directory; the sheets beside it in the same zip still are, and so is
+`ContentVersion.csv`, which holds the ContentVersion records. The log says how
+many files each such folder held:
+
+```
+  skipped 4,812 files under WE_00D_3.ZIP!ContentVersion/ (attachments, not data)
+```
+
+The folder names come from the profile (`SkippedFolders`); `--profile generic`
+skips none.
+
 **Files with the same name are parts of one object and are merged into one
 entity.** Names match case-insensitively, ignoring folders and extension. The
 parts are still read one at a time, so memory stays bounded by one part. Their
@@ -378,7 +394,7 @@ and adding it to `Profiles.Registry`:
 ```
 
 It then appears as `--profile my-export`. The hooks worth overriding are
-`IdToken` (with `EncodesTypeInValue`), `LooksLikeId`, `KeyRank`,
+`SkippedFolders`, `IdToken` (with `EncodesTypeInValue`), `LooksLikeId`, `KeyRank`,
 `ReferenceBase`, `NameAliases`, `BuiltinTargets`, `IsPolymorphic` and
 `NameForToken`.
 
@@ -424,7 +440,8 @@ Docs.Write(graph, "extract-docs");
 
 `Ingest.Run` takes several paths. To choose files first, call
 `Sources.List(paths, scratchDir)`, which returns a `Member` for every tabular
-file (nested zips are unpacked into `scratchDir`). Filter that list and pass it
+file (nested zips are unpacked into `scratchDir`); pass the profile's
+`SkippedFolders` as `skipFolders` to leave out attachments as the tool does. Filter that list and pass it
 as `new IngestOptions { Members = ... }`.
 
 ## Development

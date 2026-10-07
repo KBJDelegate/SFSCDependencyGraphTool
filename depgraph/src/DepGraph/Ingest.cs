@@ -49,7 +49,8 @@ public static class Ingest
         options ??= new IngestOptions();
         var progress = options.Progress ?? ((_, _, _) => { });
         Directory.CreateDirectory(staging);
-        var members = options.Members ?? Sources.List(sources, Path.Combine(staging, "archives"));
+        var profile = Profiles.Get(profileName);
+        var members = options.Members ?? Sources.List(sources, Path.Combine(staging, "archives"), skipFolders: profile.SkippedFolders);
         if (members.Count == 0)
             throw new UserError($"no {string.Join(", ", Sources.Tabular)} files found in {string.Join(", ", sources)}");
 
@@ -60,7 +61,6 @@ public static class Ingest
             .SelectMany(parts => parts.Select(m => (Member: m, Split: parts.Count > 1)))
             .OrderByDescending(t => t.Member.Size)
             .ToList();
-        var profile = Profiles.Get(profileName);
         var workers = tasks.Count == 1 ? 1 : options.Workers is > 0 and var w ? w : Math.Min(tasks.Count, Environment.ProcessorCount);
 
         var results = new List<Node>[tasks.Count];

@@ -206,7 +206,7 @@ public static partial class Cli
             var names = string.Join(", ", sources);
             Log($"reading {names} (profile: {profile.Name})");
 
-            var discovered = Sources.List(sources, Path.Combine(staging, "archives"), Log);
+            var discovered = Sources.List(sources, Path.Combine(staging, "archives"), Log, profile.SkippedFolders);
             var archives = discovered.Where(m => m.Name is not null).Select(m => m.Path).Distinct().Count();
             var members = discovered;
             List<string> unmatched = [];

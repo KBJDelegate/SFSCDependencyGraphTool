@@ -132,6 +132,67 @@ public sealed class SplitTests : IDisposable
         Assert.Equal(2, Node(g, "Contact")["parts"].Strings().Count);
     }
 
+    /// <summary>
+    /// An export with files included: three objects (ContentVersion among them)
+    /// beside a ContentVersion/ folder of attachments, one of which is a CSV that
+    /// would merge into Account if read, and one a zip that would be unpacked.
+    /// </summary>
+    string WithAttachments(string name)
+    {
+        var archive = tmp.File($"{name}-attachment.zip");
+        using (var inner = ZipFile.Open(archive, ZipArchiveMode.Create))
+            EndToEndTests.Write(inner, "Contact.csv", "Id,LastName\n003A00000000001,Ann\n");
+
+        var src = tmp.File($"{name}.zip");
+        using var zip = ZipFile.Open(src, ZipArchiveMode.Create);
+        EndToEndTests.Write(zip, "User.csv", "Id,Name\n005A00000000001,Ann\n005A00000000002,Bo\n");
+        EndToEndTests.Write(zip, "Account.csv", "Id,Name,OwnerId\n001A00000000001,One,005A00000000001\n001A00000000002,Two,005A00000000002\n");
+        EndToEndTests.Write(zip, "ContentVersion.csv", "Id,Title,OwnerId\n068A00000000001,Plan,005A00000000001\n");
+        EndToEndTests.Write(zip, "ContentVersion/068A00000000001", "%PDF-1.4");
+        EndToEndTests.Write(zip, "ContentVersion/Account.csv", "Id,Name\n001A00000000009,Nine\n");
+        zip.CreateEntryFromFile(archive, "ContentVersion/068A00000000002.zip");
+        return src;
+    }
+
+    [Fact]
+    public void AttachmentsUnderContentVersionAreNotRead()
+    {
+        var src = WithAttachments("files");
+        var (code, log) = Depgraph(src, "-o", tmp.File("f.json"), "--no-docs");
+        Assert.True(code == 0, log);
+        var g = Read(tmp.File("f.json"));
+        Assert.Equal(["Account", "ContentVersion", "User"], NodeIds(g));
+        Assert.Equal(2, Node(g, "Account").Num("rows"));
+        Assert.Contains("skipped 3 files under ContentVersion/ (attachments, not data)", log);
+        Assert.DoesNotContain("unpacked", log);
+    }
+
+    [Fact]
+    public void AttachmentsAreSkippedInNestedZipsAndFoldersToo()
+    {
+        var src = WithAttachments("WE_1");
+        var outer = tmp.File("outer.zip");
+        using (var zip = ZipFile.Open(outer, ZipArchiveMode.Create))
+            zip.CreateEntryFromFile(src, "WE_1.zip");
+        var folder = tmp.Sub("unzipped");
+        ZipFile.ExtractToDirectory(src, Path.Combine(folder, "export"));
+
+        foreach (var (input, where) in new[] { (outer, "WE_1.zip!ContentVersion/"), (folder, "export/ContentVersion/") })
+        {
+            var (code, log) = Depgraph(input, "-o", tmp.File("n.json"), "--no-docs");
+            Assert.True(code == 0, log);
+            Assert.Equal(["Account", "ContentVersion", "User"], NodeIds(Read(tmp.File("n.json"))));
+            Assert.Contains($"skipped 3 files under {where}", log);
+        }
+    }
+
+    [Fact]
+    public void OnlyTheSalesforceProfileSkipsContentVersion()
+    {
+        Assert.Contains("contentversion", Profiles.Get("salesforce").SkippedFolders);
+        Assert.Empty(Profiles.Get("generic").SkippedFolders);
+    }
+
     [Fact]
     public void AnUnreadableFileIsReportedNotSilentlyDropped()
     {
