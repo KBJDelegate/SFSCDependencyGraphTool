@@ -108,9 +108,12 @@ PowerShell's tab-completion adds that backslash. `depgraph` recognises the stray
 quote and strips it, but other tools won't.
 
 Before reading, the log says what was found in each zip and which objects are
-split across which zips. Then one line is written per file as it finishes, so
-no line ever needs updating. A part says it is a part, and the merged totals
-follow:
+split across which zips, and the memory budget (see
+[Memory and scale](#memory-and-scale)). Then one line is written per file as it
+finishes, so no line ever needs updating. Each gives the files done and the
+share of the data read so far, which is the better guide to how far along the
+run is: the largest files are read first, so the first few files can be most of
+the work. A part says it is a part, and the merged totals follow:
 
 ```
 found 9 files:
@@ -121,9 +124,10 @@ found 9 files:
   Task.xlsx in WE_1.zip, WE_2.zip
 skipping 1 file(s) that are identical copies of another part:
   WE_2.zip!User.xlsx
-  [1/8] WE_2.zip!Contact.csv: 1,000 rows in 0.0s (one of 2 parts of Contact)
-  [2/8] WE_1.zip!Contact.csv: 1,000 rows in 0.0s (one of 2 parts of Contact)
-  [3/8] WE_2.zip!Opportunity.xlsx: 1,500 rows in 0.0s
+memory budget: 11.1 GB (80% of the 13.9 GB free); a file starts once it fits beside the files being read. Use --memory to change it.
+  [1/8, 21% of data] WE_2.zip!Contact.csv: 1,000 rows in 0.0s (one of 2 parts of Contact)
+  [2/8, 35% of data] WE_1.zip!Contact.csv: 1,000 rows in 0.0s (one of 2 parts of Contact)
+  [3/8, 52% of data] WE_2.zip!Opportunity.xlsx: 1,500 rows in 0.0s
   ...
 merged 2 split objects:
   Contact: 2,000 rows from 2 files (1,000 + 1,000)
@@ -135,9 +139,17 @@ when other parts of the same object may still have rows. A split entity's docs
 page lists every part with its row count, and every figure on the page covers
 all the parts.
 
+While large files are being read, nothing finishes for a long time, so a line
+every minute says how far they have got, and how long the rest should take at
+the rate so far:
+
+```
+  ... 57% of data read (5.1 GB of 8.9 GB) in 1m 00s, 2 files being read, about 44s left at this rate
+```
+
 Files are read in parallel, one thread per CPU by default (`-j N` to change
-it; each reader holds what it has learnt about one file), and inner zips are
-unpacked in parallel too.
+it), as far as the memory budget allows, and inner zips are unpacked in
+parallel too.
 
 Zips inside zips are opened up to four levels deep. Each inner zip is copied to
 the staging directory first, since reading a compressed zip in place means
@@ -339,10 +351,26 @@ and why references to objects *missing* from the extract can still be named.
 
 ### Memory and scale
 
-Memory is bounded by `workers × one file`, not by the extract, because `.xlsx`
-caps a sheet at 1,048,576 rows and Salesforce caps each export zip at ~512 MB.
-A multi-GB extract is always *many* bounded files, never one huge one, and an
-object split across zips is still read one part at a time.
+Memory is bounded by the files being read at once, not by the extract, because
+`.xlsx` caps a sheet at 1,048,576 rows and Salesforce caps each export zip at
+~512 MB. A multi-GB extract is always *many* bounded files, never one huge one,
+and an object split across zips is still read one part at a time.
+
+A single file can still be large: a 512 MB zip can hold several GB of CSV, and
+reading a file takes about **1 to 1.5 bytes of memory per byte of CSV** (about 6
+per byte of `.xlsx`, whose size is compressed). So files are only started while
+they fit in a **memory budget**: by default 80% of the memory free when the run
+starts, printed at the start of the log. A file whose estimate does not fit beside
+the files already being read waits for one of them to finish, whatever `-j`
+says, and a file larger than the whole budget is read on its own. Without this, a
+14-core machine started 14 multi-GB files at once and ran out of memory: a
+5M-row CSV that takes about a minute on its own took 75 minutes while the
+machine paged to disk.
+
+`--memory GB` sets the budget yourself. Lower it if other programs need the
+memory, or raise it if the machine stays well below its memory while files
+wait: the estimate is deliberately on the high side, since reading fewer files
+at once costs far less than paging.
 
 A file is streamed rather than loaded: per column the reader keeps a hash per
 distinct value, a sample of the first 500 values, and, for identifier
@@ -354,7 +382,8 @@ Measured on 1.8M rows (185 MB of CSV across four objects, the largest a 1M-row
 MB peak for the whole process**, with output identical to the earlier Python
 version. Each file is read on one thread, so the largest file sets the floor:
 that 1M-row CSV takes 4 s on its own. Workbooks read about three times slower
-than CSV. Use `-j` to trade memory for speed.
+than CSV. On a 3 GB, 5M-row CSV: 62 s and 2.9 GB peak on its own; three of
+them with the default budget, two at a time, 154 s and 5.7 GB peak.
 
 For a very wide or very long sheet, `--max-rows N` profiles a prefix instead
 (stats become approximate; `stats.sampled` records it).
@@ -411,6 +440,7 @@ It then appears as `--profile my-export`. The hooks worth overriding are
     --json-only           write only the JSON: no diagrams, no docs
     --profile NAME        export dialect (default: salesforce)
 -j, --workers N           parallel readers (default: cpus)
+    --memory GB           memory the readers may use between them (default: 80% of the free memory)
     --max-rows N          read at most N rows per sheet (approximate stats)
     --sample N            rows sampled to classify a column (default: 500)
     --min-confidence F    drop inferred edges below this (default: 0.5)
@@ -447,7 +477,7 @@ as `new IngestOptions { Members = ... }`.
 ## Development
 
 ```bash
-dotnet test DepGraph.slnx   # 72 tests, a few seconds
+dotnet test DepGraph.slnx   # 78 tests, a few seconds
 ```
 
 The layout is `src/DepGraph` (the tool) and `tests/DepGraph.Tests` (xUnit).
