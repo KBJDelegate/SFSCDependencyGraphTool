@@ -1,17 +1,18 @@
 // Pass 1: read every sheet once, profile its columns, stage only what pass 2 needs.
 //
-// Memory is bounded by (workers x one file), not by the size of the extract.
-// That works because .xlsx caps a sheet at 1,048,576 rows and Salesforce caps
-// each zip of a data export at ~512 MB, so a multi-GB extract is always *many*
-// bounded files rather than one huge one. Only the identifier columns are
-// staged, so the working set pass 2 joins over is tiny even when the extract is
-// enormous.
+// Memory is bounded by the files being read at once, not by the size of the
+// extract. That works because .xlsx caps a sheet at 1,048,576 rows and
+// Salesforce caps each zip of a data export at ~512 MB, so a multi-GB extract
+// is always *many* bounded files rather than one huge one. A file still holds
+// about its own size in memory while it is read, so files start only while
+// their estimates fit in a memory budget, whatever the worker count. Only the
+// identifier columns are staged, so the working set pass 2 joins over is tiny
+// even when the extract is enormous.
 //
 // An object split across several files is still read one part at a time; the
 // parts are combined afterwards from mergeable statistics, so splitting never
 // costs memory.
 
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Compression;
 
@@ -22,14 +23,26 @@ public sealed record IngestOptions
     /// <summary>Parallel readers; default one per CPU.</summary>
     public int? Workers { get; init; }
 
+    /// <summary>
+    /// Bytes of memory the readers may hold between them; default
+    /// <see cref="Ingest.DefaultMemoryBudget"/>. A file starts only once its
+    /// <see cref="Ingest.MemoryEstimate"/> fits beside the files already being
+    /// read, so a machine with more cores than memory waits instead of paging.
+    /// A file larger than the whole budget is read on its own.
+    /// </summary>
+    public long? MemoryBudget { get; init; }
+
     /// <summary>Read at most this many rows per sheet (approximate statistics).</summary>
     public int? MaxRows { get; init; }
 
     /// <summary>Values sampled to decide whether a column holds identifiers.</summary>
     public int SampleN { get; init; } = 500;
 
-    /// <summary>Called once per file as it finishes: (done, total, message).</summary>
-    public Action<int, int, string>? Progress { get; init; }
+    /// <summary>Called once per file as it finishes, and every <see cref="Heartbeat"/> while none does.</summary>
+    public Action<IngestProgress>? Progress { get; init; }
+
+    /// <summary>How long the files being read may go without a report.</summary>
+    public TimeSpan Heartbeat { get; init; } = TimeSpan.FromMinutes(1);
 
     /// <summary>The files to read (from <see cref="Sources.List"/>, perhaps filtered); default all of them.</summary>
     public IReadOnlyList<Member>? Members { get; init; }
@@ -41,13 +54,44 @@ public sealed record IngestOptions
     public bool KeepEmpty { get; init; }
 }
 
+/// <summary>
+/// Where pass 1 stands. <paramref name="Message"/> says what became of the file
+/// that just finished, or is null for a report while files are still being read.
+/// <paramref name="BytesRead"/> counts finished files whole and the others as far
+/// as they have been read, so it moves while a large file is being read.
+/// </summary>
+public sealed record IngestProgress(int Done, int Total, long BytesRead, long TotalBytes, int Reading, TimeSpan Elapsed, string? Message);
+
 public static class Ingest
 {
+    // Measured on Salesforce CSVs: 1.0 to 1.5 bytes of memory per byte of text,
+    // nearly all of it the hash and identifier kept per distinct value. Paging is
+    // far slower than reading fewer files at once, so the estimate takes the top
+    // of that range. A workbook's size is compressed, so it holds several times
+    // its size in text.
+    const double CsvFactor = 1.5, WorkbookFactor = 6;
+
+    /// <summary>The memory reading <paramref name="m"/> is expected to take, in bytes.</summary>
+    public static long MemoryEstimate(Member m) =>
+        (long)(m.Size * (Path.GetExtension(m.BaseName).ToLowerInvariant() is ".csv" or ".tsv" ? CsvFactor : WorkbookFactor));
+
+    /// <summary>Files estimated at this many bytes or more are collected as soon as they finish.</summary>
+    const long CollectAfter = 64L << 20;
+
+    /// <summary>80% of the memory free now (at least 1 GB), and that free memory.</summary>
+    public static (long Budget, long Free) DefaultMemoryBudget()
+    {
+        GC.Collect(0); // the machine's memory load is only reported once the GC has run
+        var info = GC.GetGCMemoryInfo();
+        var free = Math.Max(0, info.TotalAvailableMemoryBytes - info.MemoryLoadBytes);
+        return (Math.Max(free / 10 * 8, 1L << 30), free);
+    }
+
     /// <summary>Read every object in <paramref name="sources"/> into a profiled Node.</summary>
     public static List<Node> Run(IReadOnlyList<string> sources, string staging, string profileName, IngestOptions? options = null)
     {
         options ??= new IngestOptions();
-        var progress = options.Progress ?? ((_, _, _) => { });
+        var progress = options.Progress ?? (_ => { });
         Directory.CreateDirectory(staging);
         var profile = Profiles.Get(profileName);
         var members = options.Members ?? Sources.List(sources, Path.Combine(staging, "archives"), skipFolders: profile.SkippedFolders);
@@ -62,10 +106,28 @@ public static class Ingest
             .OrderByDescending(t => t.Member.Size)
             .ToList();
         var workers = tasks.Count == 1 ? 1 : options.Workers is > 0 and var w ? w : Math.Min(tasks.Count, Environment.ProcessorCount);
+        var budget = options.MemoryBudget ?? DefaultMemoryBudget().Budget;
+        var cost = tasks.Select(t => MemoryEstimate(t.Member)).ToArray();
+        var totalBytes = tasks.Sum(t => t.Member.Size);
 
         var results = new List<Node>[tasks.Count];
-        var done = 0;
+        var read = new long[tasks.Count]; // bytes read so far, per file
+        var clock = Stopwatch.StartNew();
         var gate = new object();
+        // Guarded by gate: the next task to start, how many are running and the memory they hold.
+        int next = 0, reading = 0, done = 0;
+        long held = 0;
+        var failed = false;
+        var lastReport = TimeSpan.Zero;
+
+        IngestProgress Report(string? message)
+        {
+            lastReport = clock.Elapsed;
+            long bytes = 0;
+            for (var i = 0; i < tasks.Count; i++)
+                bytes += Math.Min(Volatile.Read(ref read[i]), tasks[i].Member.Size);
+            return new IngestProgress(done, tasks.Count, bytes, totalBytes, reading, clock.Elapsed, message);
+        }
 
         // One line per file, written once it is finished, saying what it held and,
         // when that is nothing, what becomes of it.
@@ -84,33 +146,98 @@ public static class Ingest
                 outcome = $"empty part (the object is split across {parts} files)"; // its other parts decide
             else
                 outcome = options.KeepEmpty ? "empty, kept" : "empty, excluded";
-            progress(++done, tasks.Count, $"{m.Label}: {outcome}");
+            done++;
+            progress(Report($"{m.Label}: {outcome}"));
         }
 
-        var parallel = new ParallelOptions { MaxDegreeOfParallelism = workers };
-        // NoBuffering hands the tasks out in order, so the largest really do start first.
-        var order = Partitioner.Create(Enumerable.Range(0, tasks.Count), EnumerablePartitionerOptions.NoBuffering);
-        Parallel.ForEach(order, parallel, i =>
+        // Tasks start in order, largest first, each once its memory fits beside
+        // the files already being read; with nothing being read, any file fits.
+        bool Take(out int i)
         {
-            var (m, split) = tasks[i];
-            var started = Stopwatch.StartNew();
-            var nodes = IngestMember(m, i + 1, split, staging, profile, options.MaxRows, options.SampleN);
-            results[i] = nodes;
             lock (gate)
-                Finished(m, nodes, started.Elapsed.TotalSeconds);
-        });
+            {
+                while (!failed && next < tasks.Count && held > 0 && held + cost[next] > budget)
+                    Monitor.Wait(gate);
+                i = next;
+                if (failed || next == tasks.Count)
+                    return false;
+                next++;
+                reading++;
+                held += cost[i];
+                return true;
+            }
+        }
+
+        void Work()
+        {
+            while (Take(out var i))
+            {
+                var (m, split) = tasks[i];
+                var started = Stopwatch.StartNew();
+                List<Node> nodes;
+                try
+                {
+                    nodes = IngestMember(m, i + 1, split, staging, profile, options.MaxRows, options.SampleN,
+                        n => Interlocked.Add(ref read[i], n));
+                }
+                catch
+                {
+                    lock (gate)
+                    {
+                        failed = true; // the others finish what they hold and start nothing new
+                        reading--;
+                        held -= cost[i];
+                        Monitor.PulseAll(gate);
+                    }
+                    throw;
+                }
+                results[i] = nodes;
+                // The GC would otherwise keep a large file's memory until well after the
+                // next file has filled up its own, holding twice what the budget allows.
+                if (cost[i] >= CollectAfter)
+                    GC.Collect();
+                lock (gate)
+                {
+                    reading--;
+                    held -= cost[i];
+                    Volatile.Write(ref read[i], m.Size);
+                    Monitor.PulseAll(gate);
+                    Finished(m, nodes, started.Elapsed.TotalSeconds);
+                }
+            }
+        }
+
+        // While large files are read nothing finishes for a long time; say how far they have got.
+        void Heartbeat()
+        {
+            lock (gate)
+            {
+                if (reading > 0 && clock.Elapsed - lastReport >= options.Heartbeat)
+                    progress(Report(null));
+            }
+        }
+
+        var period = TimeSpan.FromTicks(Math.Clamp(options.Heartbeat.Ticks / 4, TimeSpan.TicksPerMillisecond * 10, TimeSpan.TicksPerSecond * 5));
+        using (new Timer(_ => Heartbeat(), null, period, period))
+        {
+            // Dedicated threads: a worker waiting for memory must not hold up the thread pool.
+            Task.WaitAll(Enumerable.Range(0, workers)
+                .Select(_ => Task.Factory.StartNew(Work, TaskCreationOptions.LongRunning))
+                .ToArray());
+        }
 
         return Combine.Parts(results.SelectMany(r => r).ToList(), staging, profile, skipped);
     }
 
-    static List<Node> IngestMember(Member member, int partNo, bool split, string staging, Profile profile, int? maxRows, int sampleN)
+    static List<Node> IngestMember(Member member, int partNo, bool split, string staging, Profile profile, int? maxRows, int sampleN,
+        Action<int> onRead)
     {
         var extension = Path.GetExtension(member.BaseName).ToLowerInvariant();
         var stem = Path.GetFileNameWithoutExtension(member.BaseName);
         List<Sheet> sheets;
         try
         {
-            using var stream = Open(member, extension, staging);
+            using var stream = new CountingStream(Open(member, extension, staging), onRead);
             sheets = Readers.Read(stream, extension, stem, profile, maxRows, sampleN);
         }
         catch (Exception exc) when (exc is not OutOfMemoryException)
@@ -232,6 +359,36 @@ public static class Ingest
                 inner.Dispose();
                 owner.Dispose();
             }
+            base.Dispose(disposing);
+        }
+    }
+
+    /// <summary>A stream that reports how many bytes are read from it, for progress.</summary>
+    sealed class CountingStream(Stream inner, Action<int> onRead) : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => inner.CanSeek;
+        public override bool CanWrite => false;
+        public override long Length => inner.Length;
+        public override long Position { get => inner.Position; set => inner.Position = value; }
+
+        public override int Read(byte[] buffer, int offset, int count) => Count(inner.Read(buffer, offset, count));
+        public override int Read(Span<byte> buffer) => Count(inner.Read(buffer));
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        int Count(int n)
+        {
+            onRead(n);
+            return n;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                inner.Dispose();
             base.Dispose(disposing);
         }
     }

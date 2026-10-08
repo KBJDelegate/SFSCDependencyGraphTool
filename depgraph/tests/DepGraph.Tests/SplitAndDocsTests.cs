@@ -257,6 +257,61 @@ public sealed class SplitTests : IDisposable
         Assert.Contains("Case.csv: empty, excluded", Depgraph(src, "-o", tmp.File("a.json"), "--no-docs").Log);
         Assert.Contains("Case.csv: empty, kept", Depgraph(src, "-o", tmp.File("b.json"), "--no-docs", "--include-empty").Log);
     }
+
+    [Fact]
+    public void ProgressCountsTheDataReadAndEndsAtAllOfIt()
+    {
+        // The file count says little when the first few files are most of the data.
+        var reports = new List<IngestProgress>();
+        Ingest.Run([Fixture.SplitExtract], tmp.Sub("stg"), "salesforce", new() { Workers = 2, Progress = reports.Add });
+        var total = Sources.PlanParts(Sources.List([Fixture.SplitExtract], tmp.Sub("list"))).Groups
+            .Values.SelectMany(parts => parts).Sum(m => m.Size);
+
+        var finished = reports.Where(r => r.Message is not null).ToList();
+        Assert.Equal(Enumerable.Range(1, finished.Count), finished.Select(r => r.Done));
+        Assert.All(reports, r => Assert.Equal(total, r.TotalBytes));
+        Assert.True(reports.Zip(reports.Skip(1)).All(p => p.First.BytesRead <= p.Second.BytesRead));
+        Assert.Equal(total, reports[^1].BytesRead);
+        Assert.Equal(0, reports[^1].Reading);
+    }
+
+    [Fact]
+    public void AMemoryBudgetReadsFilesOneAtATimeWithTheSameResult()
+    {
+        // A budget of one byte fits no two files together, so each is read alone.
+        var reports = new List<IngestProgress>();
+        var sf = Profiles.Get("salesforce");
+        var tight = Infer.Run(Ingest.Run([Fixture.SplitExtract], tmp.Sub("a"), "salesforce",
+            new() { Workers = 4, MemoryBudget = 1, Progress = reports.Add }), sf);
+        var free = Infer.Run(Ingest.Run([Fixture.SplitExtract], tmp.Sub("b"), "salesforce", new() { Workers = 4 }), sf);
+
+        Assert.All(reports, r => Assert.Equal(0, r.Reading)); // nothing else was being read when one finished
+        Assert.Equal(free.Nodes.Select(n => (n.Id, n.Rows)), tight.Nodes.Select(n => (n.Id, n.Rows)));
+        Assert.Equal(free.Edges.Select(e => (e.FromNode, e.FromColumn, e.ToNode, e.ResolveRate)),
+            tight.Edges.Select(e => (e.FromNode, e.FromColumn, e.ToNode, e.ResolveRate)));
+    }
+
+    [Fact]
+    public void TheLogGivesTheMemoryBudgetAndTheShareOfDataRead()
+    {
+        var (code, log) = Depgraph(Fixture.SplitExtract, "-o", tmp.File("a.json"), "--no-docs");
+        Assert.Equal(0, code);
+        Assert.Matches(@"memory budget: [\d.,]+ [MG]B \(80% of the [\d.,]+ [MG]B free\)", log);
+        Assert.Matches(@"\[1/8, \d+% of data\] ", log);
+        Assert.Contains("[8/8, 100% of data] ", log);
+
+        (code, log) = Depgraph(Fixture.SplitExtract, "-o", tmp.File("b.json"), "--no-docs", "--memory", "0.5");
+        Assert.Equal(0, code);
+        Assert.Contains("memory budget: 500.0 MB;", log);
+        Assert.Equal(2, Depgraph(Fixture.SplitExtract, "--memory", "0").Code);
+    }
+
+    [Fact]
+    public void WhileLargeFilesAreReadTheLogSaysHowFarTheyHaveGot()
+    {
+        var line = Cli.ProgressLine(new IngestProgress(3, 1600, 50_000_000_000, 200_000_000_000, 4, TimeSpan.FromMinutes(30), null));
+        Assert.Equal("  ... 25% of data read (50.0 GB of 200.0 GB) in 30m 00s, 4 files being read, about 1h 30m left at this rate", line);
+    }
 }
 
 public sealed class ProfilerTests

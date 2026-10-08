@@ -61,6 +61,12 @@ public static partial class Cli
             DefaultValueFactory = _ => SalesforceProfile.ProfileName,
         };
         public readonly Option<int?> Workers = new("--workers", "-j") { Description = "parallel readers (default: one per CPU)", HelpName = "N" };
+        public readonly Option<double?> Memory = new("--memory")
+        {
+            Description = "memory the readers may use between them, in GB (default: 80% of the memory free at the "
+                + "start). A file starts only once it fits beside the files already being read.",
+            HelpName = "GB",
+        };
         public readonly Option<int?> MaxRows = new("--max-rows")
         {
             Description = "read at most N rows per file (faster, approximate stats)",
@@ -102,6 +108,11 @@ public static partial class Cli
         public RootCommand Command()
         {
             Profile.AcceptOnlyFromAmong([.. Profiles.Names]);
+            Memory.Validators.Add(r =>
+            {
+                if (r.GetValueOrDefault<double?>() is <= 0)
+                    r.AddError("--memory must be more than 0");
+            });
             Indent.Validators.Add(r =>
             {
                 if (r.GetValueOrDefault<int>() is < 0 or > 64)
@@ -113,7 +124,7 @@ public static partial class Cli
                 + "several zips is merged back into one.")
             {
                 Source, Out, Mermaid, Dot, Docs, NoDocs, JsonOnly, IncludeEmpty, SkipEmpty, Include,
-                Profile, Workers, MaxRows, Sample, MinConfidence, OverlapThreshold, Staging, KeepStaging, Indent,
+                Profile, Workers, Memory, MaxRows, Sample, MinConfidence, OverlapThreshold, Staging, KeepStaging, Indent,
                 Quiet,
             };
         }
@@ -234,12 +245,26 @@ public static partial class Cli
             var copies = skipped.Values.Sum(v => v.Count);
             LogPlan(Log, members, names, split.Select(g => g.Value).ToList(), skipped);
 
+            long budget;
+            if (p.GetValue(o.Memory) is { } gb)
+            {
+                budget = (long)(gb * 1e9);
+                Log($"memory budget: {Bytes(budget)}; a file starts once it fits beside the files being read");
+            }
+            else
+            {
+                (budget, var free) = Ingest.DefaultMemoryBudget();
+                Log($"memory budget: {Bytes(budget)} (80% of the {Bytes(free)} free); a file starts once it fits "
+                    + "beside the files being read. Use --memory to change it.");
+            }
+
             var nodes = Ingest.Run(sources, staging, profile.Name, new IngestOptions
             {
                 Workers = p.GetValue(o.Workers),
+                MemoryBudget = budget,
                 MaxRows = maxRows,
                 SampleN = p.GetValue(o.Sample),
-                Progress = (done, total, member) => Log($"  [{done}/{total}] {member}"),
+                Progress = r => Log(ProgressLine(r)),
                 Members = members,
                 KeepEmpty = includeEmpty,
             });
@@ -346,6 +371,32 @@ public static partial class Cli
             Log($"wrote {docsDir}{Path.DirectorySeparatorChar} ({pages} pages; start at {Path.Combine(docsDir, "README.md")})");
         return 0;
     }
+
+    /// <summary>
+    /// A finished file, with how far the whole read has got. The share is of the
+    /// data, not the files: the largest files are read first, so the first few
+    /// files can be most of the work.
+    /// </summary>
+    internal static string ProgressLine(IngestProgress r)
+    {
+        var share = r.TotalBytes > 0 ? r.BytesRead / (double)r.TotalBytes : 1;
+        if (r.Message is not null)
+            return $"  [{r.Done}/{r.Total}, {share * 100:F0}% of data] {r.Message}";
+        // Reading is about as fast per byte for small files as for large, so the
+        // rate so far gives a fair estimate of what is left.
+        var line = $"  ... {share * 100:F0}% of data read ({Bytes(r.BytesRead)} of {Bytes(r.TotalBytes)}) in {Duration(r.Elapsed)}, "
+            + $"{r.Reading} file{(r.Reading == 1 ? "" : "s")} being read";
+        if (r.BytesRead > 0 && share < 1)
+            line += $", about {Duration(r.Elapsed * ((1 - share) / share))} left at this rate";
+        return line;
+    }
+
+    static string Bytes(long n) => n >= 1e9 ? $"{n / 1e9:N1} GB" : $"{n / 1e6:N1} MB";
+
+    static string Duration(TimeSpan t) =>
+        t.TotalHours >= 1 ? $"{(int)t.TotalHours}h {t.Minutes:D2}m"
+        : t.TotalMinutes >= 1 ? $"{t.Minutes}m {t.Seconds:D2}s"
+        : $"{t.Seconds}s";
 
     /// <summary>Say what was found where, before the slow part starts.</summary>
     static void LogPlan(Action<string> log, List<Member> members, string names, List<List<Member>> split, Dictionary<string, List<string>> skipped)
