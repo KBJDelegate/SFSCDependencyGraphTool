@@ -1,8 +1,8 @@
 // Combining the parts of a split object, and choosing every object's key.
 //
 // Each part was profiled on its own. Rows, empty counts and key-prefix counts
-// add up; distinct counts come from the staged hashes, so a value present in two
-// parts counts once; identifier columns are merged into one staged column so
+// add up; distinct counts come from the staged values or their hashes, so a value
+// present in two parts counts once; identifier columns are merged into one staged column so
 // pass 2 resolves references against every part.
 
 
@@ -101,20 +101,29 @@ internal static class Combine
             IdTokens = ColumnProfiler.MostCommon(Sum(filled.Select(c => c.IdTokens))).Take(12).ToList(),
         };
 
-        var hashes = present.Where(p => p.Part.Hashed.ContainsKey(name)).Select(p => p.Part.Hashed[name]).ToList();
-        if (hashes.Count > 0)
-            stats.Distinct = Staging.CountDistinct(hashes);
-        else if (filled.Count > 0) // not staged (should not happen); a lower bound beats nothing
-            stats.Distinct = filled.Max(c => c.Distinct);
-
+        // Every filled part staged the column's distinct values, as identifiers or hashes.
+        var hashed = present.Where(p => p.Part.Hashed.ContainsKey(name)).Select(p => p.Part.Hashed[name]).ToList();
         var staged = present.Where(p => p.Part.Staged.ContainsKey(name)).Select(p => p.Part.Staged[name]).ToList();
-        if (!idLike || staged.Count == 0)
-            return (stats, null);
-        if (staged.Count == 1)
-            return (stats, staged[0]);
-        var path = $"{outStem}_{Sources.Safe(name)}.ids";
-        Staging.MergeCounts(staged, path);
-        return (stats, path);
+        string? merged = null;
+        long? counted = null;
+        if (idLike && staged.Count == 1)
+        {
+            merged = staged[0];
+        }
+        else if (idLike && staged.Count > 1)
+        {
+            merged = $"{outStem}_{Sources.Safe(name)}.ids";
+            var distinct = Staging.MergeCounts(staged, merged);
+            if (hashed.SequenceEqual(staged)) // the merge has counted every part
+                counted = distinct;
+        }
+        stats.Distinct = filled.Count switch
+        {
+            0 => 0,
+            1 => filled[0].Distinct,
+            _ => counted ?? Staging.CountDistinct(hashed, $"{outStem}_{Sources.Safe(name)}"),
+        };
+        return (stats, merged);
     }
 
     static Dictionary<string, long> Sum(IEnumerable<IEnumerable<KeyValuePair<string, long>>> counts)

@@ -22,6 +22,25 @@ public sealed class SplitTests : IDisposable
         var whole = Infer.Run(Ingest.Run([Fixture.Extract], tmp.Sub("a"), "salesforce", new() { Workers = 1 }), sf);
         var split = Infer.Run(Ingest.Run([Fixture.SplitExtract], tmp.Sub("b"), "salesforce", new() { Workers = 2 }), sf);
 
+        AssertSameStatistics(whole, split);
+    }
+
+    [Fact]
+    public void ColumnsWrittenToDiskWhileReadingGiveTheSameStatistics()
+    {
+        // A few KB per file makes every large column write sorted runs to disk many
+        // times over, whole and split; the merged runs must count exactly as memory did.
+        var sf = Profiles.Get("salesforce");
+        var memory = Infer.Run(Ingest.Run([Fixture.Extract], tmp.Sub("a"), "salesforce", new() { Workers = 1 }), sf);
+        var disk = Infer.Run(Ingest.Run([Fixture.Extract], tmp.Sub("b"), "salesforce", new() { Workers = 2, FileMemory = 32_000 }), sf);
+        var splitDisk = Infer.Run(Ingest.Run([Fixture.SplitExtract], tmp.Sub("c"), "salesforce", new() { Workers = 2, FileMemory = 32_000 }), sf);
+        AssertSameStatistics(memory, disk);
+        AssertSameStatistics(memory, splitDisk);
+        Assert.Empty(Directory.GetFiles(tmp.Sub("b"), "*run*")); // the runs are gone once their file is done
+    }
+
+    static void AssertSameStatistics(Graph whole, Graph split)
+    {
         Assert.Equal(whole.Nodes.Select(n => n.Id), split.Nodes.Select(n => n.Id));
         foreach (var (a, b) in whole.Nodes.Zip(split.Nodes))
         {
@@ -321,6 +340,70 @@ public sealed class ProfilerTests
         var p = new ColumnProfiler("c", Profiles.Get(profile), 500);
         fill(p);
         return p.Finish();
+    }
+
+    [Fact]
+    public void AColumnOverItsMemoryWritesSortedRunsAndCountsExactly()
+    {
+        using var tmp = new TempDir();
+        var sf = Profiles.Get("salesforce");
+        string Id(int i) => $"003{i:D12}AAA";
+        void Fill(ColumnProfiler ids, ColumnProfiler text)
+        {
+            // Every value twice, out of order, so runs overlap and their counts must add up.
+            for (var pass = 0; pass < 2; pass++)
+            {
+                for (var i = 0; i < 5000; i++)
+                {
+                    var n = (i * 7919 + pass * 13) % 5000;
+                    ids.AddText(Id(n), true);
+                    text.AddText($"note {n}", true);
+                }
+            }
+        }
+
+        var (memIds, memText) = (new ColumnProfiler("Id", sf, 500), new ColumnProfiler("Note", sf, 500));
+        Fill(memIds, memText);
+        var expectedIds = memIds.Finish(Path.Combine(tmp.Dir, "a"));
+        var expectedText = memText.Finish(Path.Combine(tmp.Dir, "b"), keepHashes: true);
+
+        using var spill = new Spill(tmp.Dir, "x_", 20_000);
+        var (ids, text) = (new ColumnProfiler("Id", sf, 500, spill), new ColumnProfiler("Note", sf, 500, spill));
+        Fill(ids, text);
+        Assert.True(spill.Runs > 10, $"{spill.Runs} runs");
+        Assert.True(spill.Held <= 20_000 + 200);
+        var gotIds = ids.Finish(Path.Combine(tmp.Dir, "c"));
+        var gotText = text.Finish(Path.Combine(tmp.Dir, "d"), keepHashes: true);
+
+        Assert.Equal((5000L, "id", 10000L), (gotIds.Distinct, gotIds.Type, gotIds.NonNull));
+        Assert.Equal(expectedIds.IdTokens, gotIds.IdTokens);
+        Assert.Equal(5000L, gotText.Distinct);
+        Assert.Equal(File.ReadAllBytes(memIds.StagedPath!), File.ReadAllBytes(ids.StagedPath!));
+        Assert.Equal(File.ReadAllBytes(memText.StagedPath!), File.ReadAllBytes(text.StagedPath!));
+        Assert.All(Staging.ReadCounts(ids.StagedPath!), x => Assert.Equal(2, x.Count));
+
+        spill.Dispose();
+        Assert.Empty(Directory.GetFiles(tmp.Dir, "x_*"));
+    }
+
+    [Fact]
+    public void SplitPartsStagedAsIdentifiersInOneAndHashesInAnotherCountOnce()
+    {
+        using var tmp = new TempDir();
+        var sf = Profiles.Get("salesforce");
+        // One part's sample looks like identifiers, the other's does not; both hold "003000000000001AAA".
+        var a = new ColumnProfiler("Ref", sf, 3);
+        foreach (var v in new[] { "003000000000001AAA", "003000000000002AAA", "003000000000003AAA" })
+            a.AddText(v, true);
+        var b = new ColumnProfiler("Ref", sf, 3);
+        foreach (var v in new[] { "n/a", "003000000000001AAA", "other" })
+            b.AddText(v, true);
+        Assert.True(a.Finish(Path.Combine(tmp.Dir, "a"), keepHashes: true).IsIdLike);
+        Assert.False(b.Finish(Path.Combine(tmp.Dir, "b"), keepHashes: true).IsIdLike);
+        Assert.EndsWith(".ids", a.StagedPath);
+        Assert.EndsWith(".hash", b.StagedPath);
+        Assert.Equal(5, Staging.CountDistinct([a.StagedPath!, b.StagedPath!], Path.Combine(tmp.Dir, "m")));
+        Assert.Equal(3, Staging.CountDistinct([a.StagedPath!, a.StagedPath!], Path.Combine(tmp.Dir, "m")));
     }
 
     [Fact]

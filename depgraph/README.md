@@ -178,8 +178,9 @@ parts are still read one at a time, so memory stays bounded by one part. Their
 statistics are then combined exactly, not estimated:
 
 - Rows, empty counts and key-prefix counts add up.
-- Distinct counts come from 64-bit hashes of the values staged per part, so a
-  value that appears in two parts is counted once.
+- Distinct counts come from the values staged per part (identifiers
+  themselves, other columns as 64-bit hashes), so a value that appears in two
+  parts is counted once.
 - Identifier columns are merged into one staged column before relationships
   are checked, so `resolve_rate` covers every part.
 
@@ -332,7 +333,9 @@ rather than the size of the data.
 1. **Ingest** (parallel, one reader per file). Stream each sheet once, profile
    every column as its cells go past, and stage **only the identifier-shaped
    columns** to disk as `distinct value -> row count`, sorted. A 600k-row id
-   column becomes a few MB.
+   column becomes a few MB. A column whose distinct values outgrow the file's
+   memory writes them to disk in sorted runs along the way (see
+   [Memory and scale](#memory-and-scale)).
 2. **Infer**. Propose targets from three independent signals — the type token
    inside the value, the column name, and dialect built-ins — then *check* each
    proposal with an exact merge-join of the sorted staged columns. Every edge
@@ -351,39 +354,50 @@ and why references to objects *missing* from the extract can still be named.
 
 ### Memory and scale
 
-Memory is bounded by the files being read at once, not by the extract, because
-`.xlsx` caps a sheet at 1,048,576 rows and Salesforce caps each export zip at
-~512 MB. A multi-GB extract is always *many* bounded files, never one huge one,
-and an object split across zips is still read one part at a time.
+Every file is streamed: rows go past once and are never held. What a file
+does hold is what its column statistics remember: per column a hash of each
+distinct value (to count them exactly), and for identifier columns each
+distinct value with its row count (to check references). That grows with the
+number of distinct values, about **1 to 1.5 bytes per byte of CSV** if it all
+stayed in memory.
 
-A single file can still be large: a 512 MB zip can hold several GB of CSV, and
-reading a file takes about **1 to 1.5 bytes of memory per byte of CSV** (about 6
-per byte of `.xlsx`, whose size is compressed). So files are only started while
-they fit in a **memory budget**: by default 80% of the memory free when the run
-starts, printed at the start of the log. A file whose estimate does not fit beside
-the files already being read waits for one of them to finish, whatever `-j`
-says, and a file larger than the whole budget is read on its own. Without this, a
-14-core machine started 14 multi-GB files at once and ran out of memory: a
-5M-row CSV that takes about a minute on its own took 75 minutes while the
-machine paged to disk.
+It does not stay there. Each file being read gets a **share of the memory
+budget**, and once its statistics fill that share, the column holding the most
+writes its values to disk as a sorted run and starts again empty. When the
+file is done, each column merges its runs in one streaming pass. Every count
+comes out exactly as if nothing had left memory, and the identifier files
+the relationships are checked against are byte for byte the same. So **a file
+takes the same memory however large it is**, and the files' shares add up to
+the budget.
+
+The budget is by default 80% of the memory free when the run starts, printed
+at the start of the log, and the share is the budget divided by the workers
+(at least 64 MB), so every worker can read a file at once. A small file takes
+less than its share, so it leaves room for more. Before this, a large file had
+to fit in memory whole, so large files waited for each other: on a 14-core
+machine, a 5M-row CSV that reads in about a minute took 75 minutes while 14 of
+them filled memory and the machine paged to disk.
+
+The cost is disk: the runs of the files being read sit in the staging
+directory (see `--staging`) until each file is done, at most about the size of
+their distinct values. A run is written only when a file's share fills up, so
+with plenty of memory nothing is written.
 
 `--memory GB` sets the budget yourself. Lower it if other programs need the
-memory, or raise it if the machine stays well below its memory while files
-wait: the estimate is deliberately on the high side, since reading fewer files
-at once costs far less than paging.
-
-A file is streamed rather than loaded: per column the reader keeps a hash per
-distinct value, a sample of the first 500 values, and, for identifier
-columns, each distinct value with its row count. So memory follows the number of distinct values,
-not the size of the file.
+memory. Raising it only helps until the largest files fit in their share,
+after which nothing is written to disk anyway.
 
 Measured on 1.8M rows (185 MB of CSV across four objects, the largest a 1M-row
 `Task.csv`, plus a 200k-row `.xlsx`) on a 14-core machine: **4.4 s wall, 480
 MB peak for the whole process**, with output identical to the earlier Python
 version. Each file is read on one thread, so the largest file sets the floor:
 that 1M-row CSV takes 4 s on its own. Workbooks read about three times slower
-than CSV. On a 3 GB, 5M-row CSV: 62 s and 2.9 GB peak on its own; three of
-them with the default budget, two at a time, 154 s and 5.7 GB peak.
+than CSV.
+
+On 6.9 GB of CSV, eight 3M-row files and three smaller ones, with the budget set
+to 2 GB: **42 s and 1.6 GB peak**. Holding every file's statistics in memory, as
+the tool did before, the same run had to read the large files a few at a time
+and took 114 s, with the same output.
 
 For a very wide or very long sheet, `--max-rows N` profiles a prefix instead
 (stats become approximate; `stats.sampled` records it).
@@ -440,7 +454,7 @@ It then appears as `--profile my-export`. The hooks worth overriding are
     --json-only           write only the JSON: no diagrams, no docs
     --profile NAME        export dialect (default: salesforce)
 -j, --workers N           parallel readers (default: cpus)
-    --memory GB           memory the readers may use between them (default: 80% of the free memory)
+    --memory GB           memory the readers may use between them; statistics beyond a file's share go to disk (default: 80% of the free memory)
     --max-rows N          read at most N rows per sheet (approximate stats)
     --sample N            rows sampled to classify a column (default: 500)
     --min-confidence F    drop inferred edges below this (default: 0.5)
@@ -477,7 +491,7 @@ as `new IngestOptions { Members = ... }`.
 ## Development
 
 ```bash
-dotnet test DepGraph.slnx   # 78 tests, a few seconds
+dotnet test DepGraph.slnx   # 81 tests, a few seconds
 ```
 
 The layout is `src/DepGraph` (the tool) and `tests/DepGraph.Tests` (xUnit).

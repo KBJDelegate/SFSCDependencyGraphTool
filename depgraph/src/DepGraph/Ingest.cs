@@ -1,13 +1,12 @@
 // Pass 1: read every sheet once, profile its columns, stage only what pass 2 needs.
 //
 // Memory is bounded by the files being read at once, not by the size of the
-// extract. That works because .xlsx caps a sheet at 1,048,576 rows and
-// Salesforce caps each zip of a data export at ~512 MB, so a multi-GB extract
-// is always *many* bounded files rather than one huge one. A file still holds
-// about its own size in memory while it is read, so files start only while
-// their estimates fit in a memory budget, whatever the worker count. Only the
-// identifier columns are staged, so the working set pass 2 joins over is tiny
-// even when the extract is enormous.
+// extract. Each file is streamed, and what its column statistics remember (a
+// hash or an identifier per distinct value) goes to disk in sorted runs once it
+// passes the file's share of the memory budget, so a file of any size takes at
+// most that share. Files start only while their estimates fit in the budget,
+// whatever the worker count. Only the identifier columns are staged for pass 2,
+// so the working set it joins over is small even when the extract is enormous.
 //
 // An object split across several files is still read one part at a time; the
 // parts are combined afterwards from mergeable statistics, so splitting never
@@ -31,6 +30,13 @@ public sealed record IngestOptions
     /// A file larger than the whole budget is read on its own.
     /// </summary>
     public long? MemoryBudget { get; init; }
+
+    /// <summary>
+    /// Bytes the column statistics of one file may hold before they are written to
+    /// disk; default the budget divided by the workers, so that every worker can
+    /// read a file at once.
+    /// </summary>
+    public long? FileMemory { get; init; }
 
     /// <summary>Read at most this many rows per sheet (approximate statistics).</summary>
     public int? MaxRows { get; init; }
@@ -64,16 +70,28 @@ public sealed record IngestProgress(int Done, int Total, long BytesRead, long To
 
 public static class Ingest
 {
-    // Measured on Salesforce CSVs: 1.0 to 1.5 bytes of memory per byte of text,
-    // nearly all of it the hash and identifier kept per distinct value. Paging is
-    // far slower than reading fewer files at once, so the estimate takes the top
-    // of that range. A workbook's size is compressed, so it holds several times
-    // its size in text.
+    // Measured on Salesforce CSVs held entirely in memory: 1.0 to 1.5 bytes of
+    // memory per byte of text, nearly all of it the hash and identifier kept per
+    // distinct value. A workbook's size is compressed, so it holds several times
+    // its size in text, and the reader keeps its shared strings besides.
     const double CsvFactor = 1.5, WorkbookFactor = 6;
 
-    /// <summary>The memory reading <paramref name="m"/> is expected to take, in bytes.</summary>
-    public static long MemoryEstimate(Member m) =>
-        (long)(m.Size * (Path.GetExtension(m.BaseName).ToLowerInvariant() is ".csv" or ".tsv" ? CsvFactor : WorkbookFactor));
+    // The statistics are counted as entries, not measured, and the runtime holds
+    // more than they add up to (collections grow by doubling, and freed memory
+    // waits for a collection), so they write to disk at this share of a file's memory.
+    const double SpillShare = 0.5;
+
+    // A file's share of the budget is never smaller than this, however many workers.
+    const long MinFileMemory = 64L << 20;
+
+    /// <summary>
+    /// The memory reading <paramref name="m"/> is expected to take, in bytes, when
+    /// its statistics write to disk past <paramref name="fileMemory"/>.
+    /// </summary>
+    public static long MemoryEstimate(Member m, long fileMemory) =>
+        Path.GetExtension(m.BaseName).ToLowerInvariant() is ".csv" or ".tsv"
+            ? Math.Min((long)(m.Size * CsvFactor), fileMemory)
+            : Math.Min((long)(m.Size * WorkbookFactor), fileMemory + (long)(m.Size * (WorkbookFactor - CsvFactor)));
 
     /// <summary>Files estimated at this many bytes or more are collected as soon as they finish.</summary>
     const long CollectAfter = 64L << 20;
@@ -107,7 +125,10 @@ public static class Ingest
             .ToList();
         var workers = tasks.Count == 1 ? 1 : options.Workers is > 0 and var w ? w : Math.Min(tasks.Count, Environment.ProcessorCount);
         var budget = options.MemoryBudget ?? DefaultMemoryBudget().Budget;
-        var cost = tasks.Select(t => MemoryEstimate(t.Member)).ToArray();
+        // A file's share has a floor, so that a small budget does not write a run every few
+        // values; the budget still decides how many files are read at once.
+        var fileMemory = options.FileMemory ?? Math.Max(budget / workers, MinFileMemory);
+        var cost = tasks.Select(t => MemoryEstimate(t.Member, fileMemory)).ToArray();
         var totalBytes = tasks.Sum(t => t.Member.Size);
 
         var results = new List<Node>[tasks.Count];
@@ -178,7 +199,7 @@ public static class Ingest
                 try
                 {
                     nodes = IngestMember(m, i + 1, split, staging, profile, options.MaxRows, options.SampleN,
-                        n => Interlocked.Add(ref read[i], n));
+                        (long)(Math.Min(cost[i], fileMemory) * SpillShare), n => Interlocked.Add(ref read[i], n));
                 }
                 catch
                 {
@@ -230,15 +251,17 @@ public static class Ingest
     }
 
     static List<Node> IngestMember(Member member, int partNo, bool split, string staging, Profile profile, int? maxRows, int sampleN,
-        Action<int> onRead)
+        long spillAt, Action<int> onRead)
     {
         var extension = Path.GetExtension(member.BaseName).ToLowerInvariant();
         var stem = Path.GetFileNameWithoutExtension(member.BaseName);
+        // Its runs are deleted once the columns are finished, or the file fails.
+        using var spill = new Spill(staging, $"p{partNo:D5}_", spillAt);
         List<Sheet> sheets;
         try
         {
             using var stream = new CountingStream(Open(member, extension, staging), onRead);
-            sheets = Readers.Read(stream, extension, stem, profile, maxRows, sampleN);
+            sheets = Readers.Read(stream, extension, stem, profile, maxRows, sampleN, spill);
         }
         catch (Exception exc) when (exc is not OutOfMemoryException)
         {
@@ -275,23 +298,17 @@ public static class Ingest
                 continue;
             }
 
-            node.Columns = sheet.Columns.Select(c => c.Finish()).ToList();
             // Column index, not just name, keeps "A b" and "A_b" from colliding.
             var fileStem = Path.Combine(staging, $"p{partNo:D5}s{sheetNo}_{Sources.Safe(node.Id)}");
-            for (var i = 0; i < node.Columns.Count; i++)
+            for (var i = 0; i < sheet.Columns.Count; i++)
             {
-                var col = node.Columns[i];
-                var path = $"{fileStem}__{i}_{Sources.Safe(col.Name)}";
+                var profiler = sheet.Columns[i];
+                var col = profiler.Finish($"{fileStem}__{i}_{Sources.Safe(profiler.Name)}", keepHashes: split);
+                node.Columns.Add(col);
                 if (col.IsIdLike)
-                {
-                    Staging.WriteCounts(path + ".ids", sheet.Columns[i].SortedIds());
-                    node.Staged[col.Name] = path + ".ids";
-                }
+                    node.Staged[col.Name] = profiler.StagedPath!;
                 if (split && col.NonNull > 0)
-                {
-                    Staging.WriteHashes(path + ".hash", sheet.Columns[i].SortedHashes());
-                    node.Hashed[col.Name] = path + ".hash";
-                }
+                    node.Hashed[col.Name] = profiler.StagedPath!;
             }
         }
         return nodes;

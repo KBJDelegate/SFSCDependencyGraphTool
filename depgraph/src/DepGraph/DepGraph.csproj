@@ -25,4 +25,11 @@
     <InternalsVisibleTo Include="DepGraph.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Column statistics that outgrow a file's memory go to disk, and what they held
+         becomes garbage the runtime would otherwise keep for a long time: with 11 files
+         read under a 2 GB budget the process peaked at 3.0 GB, and at 1.6 GB with this. -->
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="7" />
+  </ItemGroup>
+
 </Project>

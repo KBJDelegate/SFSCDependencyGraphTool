@@ -5,8 +5,11 @@
 //
 //   *.ids   distinct value -> row count, ordinal order, for identifier columns.
 //           Resolving a reference is a merge-join of two of these.
-//   *.hash  distinct 64-bit value hashes, ascending, for every column of a split
-//           object. A k-way merge counts distinct values across the parts exactly.
+//   *.hash  distinct 64-bit value hashes, ascending, for the other columns of a
+//           split object. A k-way merge counts distinct values across the parts exactly.
+//
+// A profiler that runs out of memory writes the same two kinds of file as
+// sorted runs, and merging its runs gives the staged file.
 
 namespace DepGraph;
 
@@ -24,6 +27,9 @@ internal static class Staging
         }
     }
 
+    static BinaryWriter? Writer(string? path) =>
+        path is null ? null : new BinaryWriter(new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, Buffer));
+
     public static IEnumerable<(string Value, long Count)> ReadCounts(string path)
     {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, Buffer);
@@ -40,7 +46,7 @@ internal static class Staging
             w.Write(h);
     }
 
-    static IEnumerable<ulong> ReadHashes(string path)
+    public static IEnumerable<ulong> ReadHashes(string path)
     {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, Buffer);
         using var r = new BinaryReader(stream);
@@ -49,25 +55,103 @@ internal static class Staging
     }
 
     /// <summary>Merge several sorted count files into one, adding the counts of values they share.</summary>
-    public static void MergeCounts(IReadOnlyList<string> inputs, string output)
+    public static long MergeCounts(IReadOnlyList<string> inputs, string output) => MergeCounts(inputs.Select(ReadCounts), output);
+
+    /// <summary>
+    /// Merge sorted (value, count) sequences, adding the counts of values they
+    /// share, into <paramref name="output"/> when given; returns the distinct values.
+    /// </summary>
+    public static long MergeCounts(IEnumerable<IEnumerable<(string Value, long Count)>> sorted, string? output)
     {
-        WriteCounts(output, Merge(inputs.Select(ReadCounts), (a, b) => string.CompareOrdinal(a.Value, b.Value))
-            .GroupAdjacent((a, b) => a.Value == b.Value)
-            .Select(run => KeyValuePair.Create(run[0].Value, run.Sum(x => x.Count))));
+        using var w = Writer(output);
+        long distinct = 0;
+        string? value = null;
+        long count = 0;
+        foreach (var item in Merge(sorted, (a, b) => string.CompareOrdinal(a.Value, b.Value)))
+        {
+            if (item.Value == value)
+            {
+                count += item.Count;
+                continue;
+            }
+            if (value is not null)
+            {
+                w?.Write(value);
+                w?.Write7BitEncodedInt64(count);
+            }
+            (value, count) = item;
+            distinct++;
+        }
+        if (value is not null)
+        {
+            w?.Write(value);
+            w?.Write7BitEncodedInt64(count);
+        }
+        return distinct;
     }
 
-    /// <summary>Distinct values over several hash files: a value present in two parts counts once.</summary>
-    public static long CountDistinct(IReadOnlyList<string> inputs)
+    /// <summary>Merge sorted hash sequences into <paramref name="output"/> when given, each hash once; returns how many.</summary>
+    public static long MergeHashes(IEnumerable<IEnumerable<ulong>> sorted, string? output)
     {
+        using var w = Writer(output);
         long distinct = 0;
         ulong? last = null;
-        foreach (var h in Merge(inputs.Select(ReadHashes), (a, b) => a.CompareTo(b)))
+        foreach (var h in Merge(sorted, (a, b) => a.CompareTo(b)))
         {
-            if (h != last)
-                distinct++;
+            if (h == last)
+                continue;
+            w?.Write(h);
+            distinct++;
             last = h;
         }
         return distinct;
+    }
+
+    /// <summary>
+    /// Distinct values over several staged files of one column: a value present in
+    /// two parts counts once. Identifiers (.ids) compare by value and the rest
+    /// (.hash) by hash; when a column is staged both ways, the identifiers are
+    /// hashed and sorted into <paramref name="scratch"/> files to compare them.
+    /// </summary>
+    public static long CountDistinct(IReadOnlyList<string> inputs, string scratch)
+    {
+        var isIds = inputs.Select(p => p.EndsWith(".ids", StringComparison.Ordinal)).ToList();
+        if (isIds.All(x => x))
+            return MergeCounts(inputs.Select(ReadCounts), null);
+        var hashed = inputs.Select((p, i) => isIds[i] ? HashIds(p, $"{scratch}_{i}") : p).ToList();
+        try
+        {
+            return MergeHashes(hashed.Select(ReadHashes), null);
+        }
+        finally
+        {
+            foreach (var (p, i) in hashed.Select((p, i) => (p, i)).Where(t => isIds[t.i]))
+                File.Delete(p);
+        }
+    }
+
+    /// <summary>A staged identifier file as a .hash file, sorted a chunk at a time so memory stays bounded.</summary>
+    static string HashIds(string ids, string stem)
+    {
+        const int chunk = 1 << 22; // 32 MB of hashes
+        var runs = new List<string>();
+        try
+        {
+            foreach (var part in ReadCounts(ids).Select(x => ColumnProfiler.Hash(x.Value)).Chunk(chunk))
+            {
+                Array.Sort(part);
+                var run = $"{stem}.run{runs.Count}";
+                WriteHashes(run, part);
+                runs.Add(run);
+            }
+            MergeHashes(runs.Select(ReadHashes), stem + ".hash");
+            return stem + ".hash";
+        }
+        finally
+        {
+            foreach (var run in runs)
+                File.Delete(run);
+        }
     }
 
     /// <summary>
@@ -117,21 +201,5 @@ internal static class Staging
             foreach (var c in cursors)
                 c.Dispose();
         }
-    }
-
-    static IEnumerable<List<T>> GroupAdjacent<T>(this IEnumerable<T> items, Func<T, T, bool> same)
-    {
-        var run = new List<T>();
-        foreach (var item in items)
-        {
-            if (run.Count > 0 && !same(run[^1], item))
-            {
-                yield return run;
-                run = [];
-            }
-            run.Add(item);
-        }
-        if (run.Count > 0)
-            yield return run;
     }
 }
