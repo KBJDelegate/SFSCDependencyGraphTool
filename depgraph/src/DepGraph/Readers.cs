@@ -1,7 +1,8 @@
 // Reading one file: CSV/TSV with Sep, workbooks with ExcelDataReader.
 //
 // Both stream rows into one ColumnProfiler per column, so memory is bounded by
-// what the profilers keep, not by the size of the file.
+// what the profilers keep, not by the size of the file, and the profilers of a
+// file share one Spill, which bounds that too.
 
 using System.Globalization;
 using ExcelDataReader;
@@ -17,15 +18,16 @@ internal static class Readers
     // ExcelDataReader looks up Windows-1252 as its fallback encoding, even for .xlsx.
     static Readers() => System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
 
-    public static List<Sheet> Read(Stream stream, string extension, string stem, Profile profile, int? maxRows, int sampleN) =>
+    public static List<Sheet> Read(Stream stream, string extension, string stem, Profile profile, int? maxRows, int sampleN,
+        Spill? spill = null) =>
         extension switch
         {
-            ".csv" => [Csv(stream, ',', stem, profile, maxRows, sampleN)],
-            ".tsv" => [Csv(stream, '\t', stem, profile, maxRows, sampleN)],
-            _ => Workbook(stream, profile, maxRows, sampleN),
+            ".csv" => [Csv(stream, ',', stem, profile, maxRows, sampleN, spill)],
+            ".tsv" => [Csv(stream, '\t', stem, profile, maxRows, sampleN, spill)],
+            _ => Workbook(stream, profile, maxRows, sampleN, spill),
         };
 
-    static Sheet Csv(Stream stream, char separator, string stem, Profile profile, int? maxRows, int sampleN)
+    static Sheet Csv(Stream stream, char separator, string stem, Profile profile, int? maxRows, int sampleN, Spill? spill)
     {
         using var text = new StreamReader(stream, detectEncodingFromByteOrderMarks: true);
         using var reader = Sep.New(separator)
@@ -43,7 +45,7 @@ internal static class Readers
                 var header = new string?[row.ColCount];
                 for (var i = 0; i < header.Length; i++)
                     header[i] = row[i].ToString();
-                columns = Profilers(header, profile, sampleN);
+                columns = Profilers(header, profile, sampleN, spill);
                 continue;
             }
             if (rows == maxRows)
@@ -59,7 +61,7 @@ internal static class Readers
         return new Sheet(stem, rows, columns ?? []);
     }
 
-    static List<Sheet> Workbook(Stream stream, Profile profile, int? maxRows, int sampleN)
+    static List<Sheet> Workbook(Stream stream, Profile profile, int? maxRows, int sampleN, Spill? spill)
     {
         using var reader = ExcelReaderFactory.CreateReader(stream);
         var sheets = new List<Sheet>();
@@ -79,7 +81,7 @@ internal static class Readers
                 sheets.Add(new Sheet(reader.Name, 0, []));
                 continue;
             }
-            var columns = Profilers(header, profile, sampleN);
+            var columns = Profilers(header, profile, sampleN, spill);
 
             long rows = 0, blank = 0;
             var values = new object?[width];
@@ -120,7 +122,7 @@ internal static class Readers
     }
 
     /// <summary>One profiler per header cell; a blank header is named by position, a repeated one is numbered.</summary>
-    static List<ColumnProfiler> Profilers(string?[] header, Profile profile, int sampleN)
+    static List<ColumnProfiler> Profilers(string?[] header, Profile profile, int sampleN, Spill? spill)
     {
         var seen = new Dictionary<string, int>(StringComparer.Ordinal);
         var output = new List<ColumnProfiler>(header.Length);
@@ -136,7 +138,7 @@ internal static class Readers
             {
                 seen[name] = 0;
             }
-            output.Add(new ColumnProfiler(name, profile, sampleN));
+            output.Add(new ColumnProfiler(name, profile, sampleN, spill));
         }
         return output;
     }

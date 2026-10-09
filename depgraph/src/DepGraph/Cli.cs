@@ -64,7 +64,7 @@ public static partial class Cli
         public readonly Option<double?> Memory = new("--memory")
         {
             Description = "memory the readers may use between them, in GB (default: 80% of the memory free at the "
-                + "start). A file starts only once it fits beside the files already being read.",
+                + "start). Each file being read gets a share, and column statistics beyond it are written to disk.",
             HelpName = "GB",
         };
         public readonly Option<int?> MaxRows = new("--max-rows")

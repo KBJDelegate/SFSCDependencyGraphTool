@@ -60,8 +60,9 @@ public sealed class Node
     public Dictionary<string, string> Staged { get; } = [];
 
     /// <summary>
-    /// Column name -> staged file of distinct value hashes; only for split objects,
-    /// where it lets distinct counts be combined exactly across the parts.
+    /// Column name -> staged file of its distinct values, only for split objects,
+    /// where it lets distinct counts be combined exactly across the parts: the
+    /// identifier file for an identifier column, else a file of value hashes.
     /// </summary>
     public Dictionary<string, string> Hashed { get; } = [];
 

@@ -7,6 +7,12 @@
 // row count, which is what gets staged for pass 2. From then on that dictionary
 // also gives the distinct count, so the column stops hashing.
 //
+// The hashes and identifiers grow with the number of distinct values, so they
+// do not stay in memory: once the profilers of a file hold more than their
+// Spill allows, the largest writes what it has to disk as a sorted run and
+// starts again. Finish merges the runs with what is left in memory, so every
+// count is exact, as if nothing had left memory.
+//
 // No data value leaves this class except the staged identifiers, which pass 2
 // needs to check references and which never reach the output: the statistics
 // are types and counts only, never values, ranges or picklists.
@@ -18,10 +24,19 @@ using System.Text.RegularExpressions;
 
 namespace DepGraph;
 
-internal sealed partial class ColumnProfiler(string name, Profile profile, int sampleN)
+internal sealed partial class ColumnProfiler
 {
     static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
     const NumberStyles FloatStyle = NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint | NumberStyles.AllowExponent;
+
+    // Rough bytes per entry, counting the collection's own arrays and their room to grow.
+    const long HashBytes = 24;
+    static long IdBytes(int length) => 64 + 2L * length;
+
+    readonly string name;
+    readonly Profile profile;
+    readonly int sampleN;
+    readonly Spill? spill;
 
     long rows, nulls;
 
@@ -29,27 +44,75 @@ internal sealed partial class ColumnProfiler(string name, Profile profile, int s
     long ints, floats, bools, dates, texts;
     int maxLength;
 
-    readonly HashSet<ulong> hashes = [];
+    HashSet<ulong> hashes = [];
     readonly List<string> sample = [];
     bool decided;
     Dictionary<string, long>? ids;
+    readonly Dictionary<string, long> tokens = new(StringComparer.Ordinal);
+
+    // Sorted runs on disk: of hashes until the column is found to hold identifiers, then of identifiers.
+    readonly List<string> runs = [];
+
+    /// <param name="spill">Shared by the profilers of one file; without it everything stays in memory.</param>
+    public ColumnProfiler(string name, Profile profile, int sampleN, Spill? spill = null)
+    {
+        this.name = name;
+        this.profile = profile;
+        this.sampleN = sampleN;
+        this.spill = spill;
+        spill?.Add(this);
+    }
 
     public string Name => name;
     public long NonNull => rows - nulls;
 
-    /// <summary>The distinct values with their row counts, once <see cref="Finish"/> found identifiers.</summary>
-    public KeyValuePair<string, long>[] SortedIds()
+    /// <summary>Estimated bytes this column's hashes or identifiers hold in memory.</summary>
+    public long Held { get; private set; }
+
+    /// <summary>The file <see cref="Finish"/> staged: sorted identifiers (.ids) or sorted hashes (.hash); null if none.</summary>
+    public string? StagedPath { get; private set; }
+
+    KeyValuePair<string, long>[] SortedIds()
     {
         var sorted = (ids ?? []).ToArray();
         Array.Sort(sorted, (a, b) => string.CompareOrdinal(a.Key, b.Key));
         return sorted;
     }
 
-    public ulong[] SortedHashes()
+    ulong[] SortedHashes()
     {
-        var sorted = ids is null ? hashes.ToArray() : ids.Keys.Select(Hash).ToArray();
+        var sorted = hashes.ToArray();
         Array.Sort(sorted);
         return sorted;
+    }
+
+    void Grow(long bytes)
+    {
+        Held += bytes;
+        spill?.Grew(bytes);
+    }
+
+    /// <summary>Write what is in memory to disk as a sorted run and start again empty.</summary>
+    internal void WriteRun()
+    {
+        if (spill is null || Held == 0)
+            return;
+        var path = spill.NextRun();
+        if (ids is not null)
+        {
+            CountTokens();
+            Staging.WriteCounts(path, SortedIds());
+            ids = new Dictionary<string, long>(StringComparer.Ordinal);
+        }
+        else
+        {
+            Staging.WriteHashes(path, SortedHashes());
+            hashes = [];
+        }
+        runs.Add(path);
+        var held = Held;
+        Held = 0;
+        spill.Grew(-held);
     }
 
     public void AddNull()
@@ -141,15 +204,16 @@ internal sealed partial class ColumnProfiler(string name, Profile profile, int s
         }
     }
 
-    static ulong Hash(string text) => Hash(text.AsSpan());
-
-    static ulong Hash(ReadOnlySpan<char> text) => XxHash3.HashToUInt64(MemoryMarshal.AsBytes(text));
+    internal static ulong Hash(ReadOnlySpan<char> text) => XxHash3.HashToUInt64(MemoryMarshal.AsBytes(text));
 
     void Observe(ReadOnlySpan<char> text)
     {
+        if (text.Length > maxLength)
+            maxLength = Math.Max(maxLength, CodePoints(text));
+
         // An identifier column counts its distinct values in ids instead.
-        if (ids is null)
-            hashes.Add(Hash(text));
+        if (ids is null && hashes.Add(Hash(text)))
+            Grow(HashBytes);
 
         if (!decided)
         {
@@ -159,11 +223,26 @@ internal sealed partial class ColumnProfiler(string name, Profile profile, int s
         }
         else if (ids is not null)
         {
-            CollectionsMarshal.GetValueRefOrAddDefault(ids.GetAlternateLookup<ReadOnlySpan<char>>(), text, out _)++;
+            CollectionsMarshal.GetValueRefOrAddDefault(ids.GetAlternateLookup<ReadOnlySpan<char>>(), text, out var seen)++;
+            if (!seen)
+                Grow(IdBytes(text.Length)); // last: it may write ids to disk and start a new dictionary
         }
+    }
 
-        if (text.Length > maxLength)
-            maxLength = Math.Max(maxLength, CodePoints(text));
+    /// <summary>
+    /// For a dialect that encodes the target type in the value, add the rows of
+    /// each token among the identifiers in memory, before they go to disk.
+    /// </summary>
+    void CountTokens()
+    {
+        if (!profile.EncodesTypeInValue)
+            return;
+        var lookup = tokens.GetAlternateLookup<ReadOnlySpan<char>>();
+        foreach (var (value, count) in ids!)
+        {
+            if (value.Length is 15 or 18)
+                CollectionsMarshal.GetValueRefOrAddDefault(lookup, value.AsSpan(0, 3), out _) += count;
+        }
     }
 
     /// <summary>The sample is complete: from here on, count every value if they are identifiers.</summary>
@@ -175,8 +254,12 @@ internal sealed partial class ColumnProfiler(string name, Profile profile, int s
         ids = new Dictionary<string, long>(StringComparer.Ordinal);
         foreach (var s in sample)
             ids[s] = ids.GetValueOrDefault(s) + 1;
-        hashes.Clear();
-        hashes.TrimExcess();
+        // Hashes already on disk are left for the Spill to delete.
+        runs.Clear();
+        hashes = [];
+        var held = ids.Sum(kv => IdBytes(kv.Key.Length)) - Held;
+        Held += held;
+        spill?.Grew(held);
     }
 
     static int CodePoints(ReadOnlySpan<char> text)
@@ -204,23 +287,32 @@ internal sealed partial class ColumnProfiler(string name, Profile profile, int s
         return "string"; // mixed kinds, e.g. numbers and flags in one column
     }
 
-    public ColumnStats Finish()
+    /// <summary>
+    /// The column's statistics. With <paramref name="stage"/>, identifiers are
+    /// staged at <c>stage.ids</c> for pass 2, and with <paramref name="keepHashes"/>
+    /// (for an object split across files) every other column's hashes at
+    /// <c>stage.hash</c>, so the parts' distinct counts can be combined;
+    /// <see cref="StagedPath"/> says which was written.
+    /// </summary>
+    public ColumnStats Finish(string? stage = null, bool keepHashes = false)
     {
+        var type = TypeName();
+        if (type == "string" && !decided)
+            Decide();
+        var isId = type == "string" && ids is not null;
         var stats = new ColumnStats
         {
             Name = name,
-            Type = TypeName(),
+            Type = type,
             Rows = rows,
             Nulls = nulls,
-            Distinct = ids?.Count ?? hashes.Count,
+            Distinct = CountDistinct(stage is not null && (isId || (keepHashes && NonNull > 0)) ? stage : null),
         };
         if (stats.Type != "string")
             return stats;
 
         stats.MaxLength = maxLength;
-        if (!decided)
-            Decide();
-        stats.IsIdLike = ids is not null;
+        stats.IsIdLike = isId;
         if (!stats.IsIdLike)
         {
             stats.Type = DateKind(sample) ?? stats.Type;
@@ -230,14 +322,27 @@ internal sealed partial class ColumnProfiler(string name, Profile profile, int s
         stats.Type = "id";
         if (profile.EncodesTypeInValue)
         {
-            // Dialect encodes the target type in the value: count tokens over all rows.
-            var tokens = ids!
-                .Where(kv => kv.Key.Length is 15 or 18)
-                .GroupBy(kv => kv.Key[..3], StringComparer.Ordinal)
-                .Select(g => KeyValuePair.Create(g.Key, g.Sum(kv => kv.Value)));
+            CountTokens();
             stats.IdTokens = MostCommon(tokens).Take(12).ToList();
         }
         return stats;
+    }
+
+    /// <summary>Distinct values over the runs and memory, writing them all to <paramref name="stage"/> when given.</summary>
+    long CountDistinct(string? stage)
+    {
+        if (ids is not null)
+        {
+            if (stage is null && runs.Count == 0)
+                return ids.Count;
+            StagedPath = stage is null ? null : stage + ".ids";
+            IEnumerable<(string, long)> memory = SortedIds().Select(kv => (kv.Key, kv.Value));
+            return Staging.MergeCounts(runs.Select(Staging.ReadCounts).Append(memory), StagedPath);
+        }
+        if (stage is null && runs.Count == 0)
+            return hashes.Count;
+        StagedPath = stage is null ? null : stage + ".hash";
+        return Staging.MergeHashes(runs.Select(Staging.ReadHashes).Append(SortedHashes()), StagedPath);
     }
 
     /// <summary>Most common first; ties in ordinal order, so output never depends on hashing.</summary>
